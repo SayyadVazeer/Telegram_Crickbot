@@ -2,6 +2,7 @@ import json
 import os
 import re
 import sqlite3
+import asyncio
 import hashlib
 from typing import Any, Dict, List, Optional
 
@@ -31,6 +32,11 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ADMIN_USER_IDS = os.getenv("TELEGRAM_ADMIN_USER_IDS", os.getenv("TELEGRAM_ADMIN_USER_ID", "")).strip()
 DATABASE_PATH = os.getenv("TOURNAMENT_DB_PATH", "tournament.db").strip() or "tournament.db"
 
+async def cancel_match_wait(user_id: int):
+    await asyncio.sleep(300)
+
+    if user_id in waiting_for_match:
+        waiting_for_match.pop(user_id, None)
 
 def parse_admin_ids(value: str) -> set[int]:
     if not value:
@@ -746,6 +752,14 @@ def format_caps(players: Dict[str, Dict[str, Any]], top_n: int = 10) -> str:
 
 state = TournamentState()
 tournament_db = TournamentDatabase(DATABASE_PATH)
+# Stores admins who clicked "Add Match" and are allowed to send one JSON
+waiting_for_match: Dict[int, bool] = {}
+
+# Optional:
+# Put your match topic ID here if using Telegram forum topics.
+# Example: MATCH_TOPIC_ID = 123456
+# Set to None to allow any topic.
+MATCH_TOPIC_ID = None
 squad_team_tokens: Dict[str, str] = {}
 for admin_id in parse_admin_ids(ADMIN_USER_IDS):
     state.set_admin(admin_id)
@@ -807,6 +821,7 @@ def build_main_keyboard(user_id: Optional[int] = None) -> Any:
         ],
         [
             InlineKeyboardButton("Prompt", callback_data="prompt"),
+            InlineKeyboardButton("➕Match", callback_data="add_match"),
             InlineKeyboardButton("Squads", callback_data="squads"),
         ],
     ]
@@ -1016,17 +1031,6 @@ async def set_admin_command(update: Any, context: Any) -> None:
     await update.message.reply_text(f"Added admin {new_admin_id}.")
 
 
-async def handle_text_message(update: Any, context: Any) -> None:
-    text = update.message.text or ""
-    if text.startswith("/"):
-        return
-
-    user_id = None
-    if getattr(update.message, "from_user", None) is not None:
-        user_id = update.message.from_user.id
-
-    reply = handle_message(text, user_id=user_id)
-    await update.message.reply_text(reply, reply_markup=build_main_keyboard(user_id))
 
 
 async def handle_callback_query(update: Any, context: Any) -> None:
@@ -1072,16 +1076,33 @@ async def handle_callback_query(update: Any, context: Any) -> None:
         text = "Prompt:\n\n" + build_match_prompt()
         await query.answer(text="Prompt ready")
         await query.message.reply_text(text, reply_markup=build_main_keyboard(user_id))
+        
     elif data == "add_match":
-        text = (
-            "Send match data as JSON or plain text.\n\n"
-            "Example:\n"
-            "```json\n"
-            '{"team1":"India","team2":"Pakistan","score1":180,"wickets1":6,"balls1":120,"score2":175,"wickets2":7,"balls2":110,"players":{"India":{"Rohit":{"runs":80,"wickets":0},"Kohli":{"runs":50,"wickets":1}},"Pakistan":{"Babar":{"runs":60,"wickets":0},"Shaheen":{"runs":20,"wickets":2}}}}}\n'
-            "```"
+
+        if user_id is None or not state.is_admin(user_id):
+            await query.answer(
+                "Only admins can add matches.",
+                show_alert=True
+            )
+            return
+
+        waiting_for_match[user_id] = True
+
+        # Start 5 minute timeout
+        asyncio.create_task(
+            cancel_match_wait(user_id)
         )
-        await query.answer(text="Send your match")
-        await query.message.reply_text(text, reply_markup=build_main_keyboard(user_id))
+
+        await query.answer(
+            "Waiting for match JSON"
+        )
+
+
+        await query.message.reply_text(
+            "📥 Send the match JSON now.\n\n"
+            "Only your next message will be processed as a match.\n"
+            "All other group messages are ignored."
+        )
     elif data == "end_tournament":
         if user_id is None or not state.is_admin(user_id):
             await query.message.reply_text("Only an admin can end and clear a tournament.")
@@ -1149,11 +1170,46 @@ def main() -> None:
     app.add_handler(CommandHandler("addplayer", add_player_command))
     app.add_handler(CommandHandler("setadmin", set_admin_command))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    app.add_handler(
+    MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        handle_text_message
+    )
+)
 
     print("Bot started. Press Ctrl+C to stop.")
     app.run_polling()
 
+async def handle_text_message(update, context) -> None:
+    async def handle_text_message(update, context) -> None:
+        if not update.message or not update.message.text:
+            return
 
+    user_id = update.message.from_user.id if update.message.from_user else None
+
+    # Ignore every message unless admin clicked Add Match
+    if user_id not in waiting_for_match:
+        return
+
+    text = update.message.text
+
+    # Remove waiting state so only ONE message is accepted
+    waiting_for_match.pop(user_id, None)
+
+    match_data = parse_match(text)
+
+    if match_data:
+        state.apply_match(match_data)
+
+        await update.message.reply_text(
+            f"✅ Match added successfully.\n\n"
+            f"{format_standings(state.get_standings())}",
+            reply_markup=build_main_keyboard(user_id)
+        )
+
+    else:
+        await update.message.reply_text(
+            "❌ Invalid match JSON.\nUse /help for the correct format."
+        )
 if __name__ == "__main__":
     main()
