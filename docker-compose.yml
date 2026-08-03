@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  tournament-bot:
+    build: .
+    container_name: tournament-bot
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    volumes:
+      - tournament-data:/app/data
+
+volumes:
+  tournament-data:

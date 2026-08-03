@@ -29,8 +29,11 @@ except ImportError:  # pragma: no cover - optional dependency
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-ADMIN_USER_IDS = os.getenv("TELEGRAM_ADMIN_USER_IDS", os.getenv("TELEGRAM_ADMIN_USER_ID", "")).strip()
-DATABASE_PATH = os.getenv("DATABASE_PATH", "tournament.db").strip() or "tournament.db"
+ADMIN_USER_IDS = os.getenv("TELEGRAM_ADMIN_USER_IDS", os.getenv("TELEGRAM_ADMIN_USER_IDs", "")).strip()
+DATABASE_PATH = os.getenv(
+    "DATABASE_PATH",
+    "/app/data/tournament.db"
+).strip()
 
 async def cancel_match_wait(user_id: int):
     await asyncio.sleep(300)
@@ -222,6 +225,10 @@ class TournamentDatabase:
 
     def __init__(self, path):
         self.path = path
+        directory = os.path.dirname(self.path)
+
+        if directory:
+            os.makedirs(directory, exist_ok=True)
 
         with sqlite3.connect(self.path) as conn:
             conn.executescript("""
@@ -235,7 +242,11 @@ class TournamentDatabase:
                 points INTEGER DEFAULT 0,
                 runs_scored INTEGER DEFAULT 0,
                 runs_conceded INTEGER DEFAULT 0,
-                net_run_rate REAL DEFAULT 0
+                net_run_rate REAL DEFAULT 0,
+                balls_faced INTEGER DEFAULT 0,
+                balls_bowled INTEGER DEFAULT 0,
+                overs_faced REAL DEFAULT 0,
+                overs_bowled REAL DEFAULT 0
             );
 
 
@@ -305,18 +316,37 @@ class TournamentDatabase:
 
             conn.execute("""
             INSERT INTO standings
-            VALUES (?,?,?,?,?,?,?,?,?)
+        (
+            team,
+            played,
+            wins,
+            draws,
+            losses,
+            points,
+            runs_scored,
+            runs_conceded,
+            net_run_rate,
+            balls_faced,
+            balls_bowled,
+            overs_faced,
+            overs_bowled
+        )
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(team)
             DO UPDATE SET
 
-            played=?,
+                        played=?,
             wins=?,
             draws=?,
             losses=?,
             points=?,
             runs_scored=?,
             runs_conceded=?,
-            net_run_rate=?
+            net_run_rate=?,
+            balls_faced=?,
+            balls_bowled=?,
+            overs_faced=?,
+            overs_bowled=?
 
             """,
             (
@@ -329,6 +359,10 @@ class TournamentDatabase:
             stats["runs_scored"],
             stats["runs_conceded"],
             stats["net_run_rate"],
+            stats["balls_faced"],
+            stats["balls_bowled"],
+            stats["overs_faced"],
+            stats["overs_bowled"],
 
             stats["played"],
             stats["wins"],
@@ -337,8 +371,12 @@ class TournamentDatabase:
             stats["points"],
             stats["runs_scored"],
             stats["runs_conceded"],
-            stats["net_run_rate"]
-            ))
+            stats["net_run_rate"],
+            stats["balls_faced"],
+            stats["balls_bowled"],
+            stats["overs_faced"],
+            stats["overs_bowled"],
+        ))
 
 
 
@@ -400,6 +438,10 @@ class TournamentDatabase:
                     "runs_scored": row[6],
                     "runs_conceded": row[7],
                     "net_run_rate": row[8],
+                    "balls_faced": row[9],
+                    "balls_bowled": row[10],
+                    "overs_faced": row[11],
+                    "overs_bowled": row[12],
                 }
 
             rows = conn.execute(
@@ -415,10 +457,12 @@ class TournamentDatabase:
                     "runs_conceded": row[5],
                     "balls_bowled": row[6],
                 }
-        rows = conn.execute("SELECT data FROM matches").fetchall()
+            rows = conn.execute(
+                    "SELECT data FROM matches"
+                ).fetchall()
 
-        for row in rows:
-            data["matches"].append(json.loads(row[0]))
+            for row in rows:
+                    data["matches"].append(json.loads(row[0]))
         return data
 
 def _get_match_overs(match_data: Dict[str, object]) -> float:
@@ -906,6 +950,7 @@ saved = database.load_all()
 
 state.teams = saved["teams"]
 state.players = saved["players"]
+state.matches = saved["matches"]
 # Stores admins who clicked "Add Match" and are allowed to send one JSON
 waiting_for_match: Dict[int, bool] = {}
 
@@ -936,6 +981,18 @@ def build_help() -> str:
         "/JsonSample - Display Json Sample expecting \n"
     )
 
+async def prompt_command(update, context):
+
+    await update.message.reply_text(
+        build_match_prompt()
+    )
+
+
+async def jsonsample_command(update, context):
+
+    await update.message.reply_text(
+        build_match_JsonSample()
+    )
 
 def build_main_keyboard(user_id: Optional[int] = None) -> Any:
     if InlineKeyboardButton is None or InlineKeyboardMarkup is None:
@@ -1029,6 +1086,8 @@ async def set_admin_command(update: Any, context: Any) -> None:
     user_id = None
     if getattr(update.message, "from_user", None) is not None:
         user_id = update.message.from_user.id
+
+
     if user_id is None or not state.is_admin(user_id):
         await update.message.reply_text("Only admins can change admin access.")
         return
@@ -1054,7 +1113,7 @@ async def handle_callback_query(update: Any, context: Any) -> None:
     await query.answer()
     data = query.data or ""
     user_id = getattr(getattr(query, "from_user", None), "id", None)
-
+    
     if data == "standings":
         text = format_standings(state.get_standings())
         await query.message.reply_text(text, reply_markup=build_main_keyboard(user_id))
@@ -1198,10 +1257,25 @@ def main() -> None:
     app.add_handler(CommandHandler("setadmin", set_admin_command))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(
+        CommandHandler(
+            "prompt",
+            prompt_command
+        )
+    )
+
+
+    app.add_handler(
+        CommandHandler(
+            "jsonsample",
+            jsonsample_command
+        )
+    )
+    app.add_handler(
     MessageHandler(
         filters.TEXT & ~filters.COMMAND,
         handle_text_message
     )
+    
 )
 
     print("Bot started. Press Ctrl+C to stop.")
