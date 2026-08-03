@@ -30,12 +30,12 @@ load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ADMIN_USER_IDS = os.getenv("TELEGRAM_ADMIN_USER_IDS", os.getenv("TELEGRAM_ADMIN_USER_ID", "")).strip()
-DATABASE_PATH = os.getenv("TOURNAMENT_DB_PATH", "tournament.db").strip() or "tournament.db"
+DATABASE_PATH = os.getenv("DATABASE_PATH", "tournament.db").strip() or "tournament.db"
 
 async def cancel_match_wait(user_id: int):
     await asyncio.sleep(300)
 
-    if user_id in waiting_for_match:
+    if waiting_for_match.get(user_id):
         waiting_for_match.pop(user_id, None)
 
 def parse_admin_ids(value: str) -> set[int]:
@@ -218,88 +218,208 @@ class TournamentState:
             -float(item["net_run_rate"]),
         ))
         return standings
-
-
 class TournamentDatabase:
-    """Small local SQLite store for auction squads and player purchase prices."""
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path):
         self.path = path
-        self._memory_connection: Optional[sqlite3.Connection] = None
-        if path == ":memory:":
-            self._memory_connection = sqlite3.connect(path)
-            self._memory_connection.execute("PRAGMA foreign_keys = ON")
-        with self._connect() as connection:
-            connection.executescript("""
-                CREATE TABLE IF NOT EXISTS auction_teams (
-                    name TEXT PRIMARY KEY COLLATE NOCASE
-                );
-                CREATE TABLE IF NOT EXISTS auction_players (
-                    team_name TEXT NOT NULL COLLATE NOCASE,
-                    player_name TEXT NOT NULL COLLATE NOCASE,
-                    purchase_price REAL NOT NULL CHECK (purchase_price >= 0),
-                    PRIMARY KEY (team_name, player_name),
-                    FOREIGN KEY (team_name) REFERENCES auction_teams(name) ON DELETE CASCADE
-                );
+
+        with sqlite3.connect(self.path) as conn:
+            conn.executescript("""
+            
+            CREATE TABLE IF NOT EXISTS standings (
+                team TEXT PRIMARY KEY,
+                played INTEGER DEFAULT 0,
+                wins INTEGER DEFAULT 0,
+                draws INTEGER DEFAULT 0,
+                losses INTEGER DEFAULT 0,
+                points INTEGER DEFAULT 0,
+                runs_scored INTEGER DEFAULT 0,
+                runs_conceded INTEGER DEFAULT 0,
+                net_run_rate REAL DEFAULT 0
+            );
+
+
+            CREATE TABLE IF NOT EXISTS player_stats (
+                player TEXT PRIMARY KEY,
+                runs INTEGER DEFAULT 0,
+                wickets INTEGER DEFAULT 0,
+                matches INTEGER DEFAULT 0,
+                balls_faced INTEGER DEFAULT 0,
+                runs_conceded INTEGER DEFAULT 0,
+                balls_bowled INTEGER DEFAULT 0
+            );
+
+
+            CREATE TABLE IF NOT EXISTS matches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                team1 TEXT,
+                team2 TEXT,
+                score1 INTEGER,
+                score2 INTEGER,
+                wickets1 INTEGER,
+                wickets2 INTEGER,
+                balls1 INTEGER,
+                balls2 INTEGER,
+                data TEXT
+            );
+
             """)
 
-    def _connect(self) -> sqlite3.Connection:
-        if self._memory_connection is not None:
-            return self._memory_connection
-        connection = sqlite3.connect(self.path)
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
+    def clear_tournament(self):
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("DELETE FROM standings")
+            conn.execute("DELETE FROM player_stats")
+            conn.execute("DELETE FROM matches")
+    def save_match(self, match):
 
-    def add_team(self, name: str) -> bool:
-        with self._connect() as connection:
-            cursor = connection.execute("INSERT OR IGNORE INTO auction_teams (name) VALUES (?)", (name.strip(),))
-            return cursor.rowcount == 1
+        with sqlite3.connect(self.path) as conn:
 
-    def add_player(self, team_name: str, player_name: str, purchase_price: float) -> bool:
-        with self._connect() as connection:
-            team = connection.execute("SELECT 1 FROM auction_teams WHERE name = ?", (team_name.strip(),)).fetchone()
-            if team is None:
-                return False
-            connection.execute(
-                """INSERT INTO auction_players (team_name, player_name, purchase_price)
-                   VALUES (?, ?, ?)
-                   ON CONFLICT(team_name, player_name) DO UPDATE SET purchase_price = excluded.purchase_price""",
-                (team_name.strip(), player_name.strip(), purchase_price),
+            conn.execute("""
+            INSERT INTO matches
+            (
+            team1,team2,
+            score1,score2,
+            wickets1,wickets2,
+            balls1,balls2,
+            data
             )
-            return True
+            VALUES (?,?,?,?,?,?,?,?,?)
+            """,
+            (
+            match["team1"],
+            match["team2"],
+            match["score1"],
+            match["score2"],
+            match["wickets1"],
+            match["wickets2"],
+            match["balls1"],
+            match["balls2"],
+            json.dumps(match)
+            ))
 
-    def get_squads(self) -> List[Dict[str, object]]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                """SELECT t.name, p.player_name, p.purchase_price
-                   FROM auction_teams AS t
-                   LEFT JOIN auction_players AS p ON p.team_name = t.name
-                   ORDER BY t.name COLLATE NOCASE, p.player_name COLLATE NOCASE"""
+
+
+    def save_standing(self,name,stats):
+
+        with sqlite3.connect(self.path) as conn:
+
+            conn.execute("""
+            INSERT INTO standings
+            VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(team)
+            DO UPDATE SET
+
+            played=?,
+            wins=?,
+            draws=?,
+            losses=?,
+            points=?,
+            runs_scored=?,
+            runs_conceded=?,
+            net_run_rate=?
+
+            """,
+            (
+            name,
+            stats["played"],
+            stats["wins"],
+            stats["draws"],
+            stats["losses"],
+            stats["points"],
+            stats["runs_scored"],
+            stats["runs_conceded"],
+            stats["net_run_rate"],
+
+            stats["played"],
+            stats["wins"],
+            stats["draws"],
+            stats["losses"],
+            stats["points"],
+            stats["runs_scored"],
+            stats["runs_conceded"],
+            stats["net_run_rate"]
+            ))
+
+
+
+    def save_player_stat(self,name,stats):
+
+        with sqlite3.connect(self.path) as conn:
+
+            conn.execute("""
+            INSERT INTO player_stats
+            VALUES (?,?,?,?,?,?,?)
+
+            ON CONFLICT(player)
+            DO UPDATE SET
+
+            runs=?,
+            wickets=?,
+            matches=?,
+            balls_faced=?,
+            runs_conceded=?,
+            balls_bowled=?
+
+            """,
+            (
+            name,
+            stats["runs"],
+            stats["wickets"],
+            stats["matches"],
+            stats["balls_faced"],
+            stats["runs_conceded"],
+            stats["balls_bowled"],
+
+            stats["runs"],
+            stats["wickets"],
+            stats["matches"],
+            stats["balls_faced"],
+            stats["runs_conceded"],
+            stats["balls_bowled"]
+            ))
+    def load_all(self):
+        data = {
+            "teams": {},
+            "players": {},
+            "matches": []
+        }
+
+        with sqlite3.connect(self.path) as conn:
+
+            rows = conn.execute(
+                "SELECT * FROM standings"
             ).fetchall()
-        return [
-            {"team": team_name, "player": player_name, "purchase_price": purchase_price}
-            for team_name, player_name, purchase_price in rows
-        ]
 
-    def get_team_names(self) -> List[str]:
-        with self._connect() as connection:
-            rows = connection.execute("SELECT name FROM auction_teams ORDER BY name COLLATE NOCASE").fetchall()
-        return [str(row[0]) for row in rows]
+            for row in rows:
+                data["teams"][row[0]] = {
+                    "played": row[1],
+                    "wins": row[2],
+                    "draws": row[3],
+                    "losses": row[4],
+                    "points": row[5],
+                    "runs_scored": row[6],
+                    "runs_conceded": row[7],
+                    "net_run_rate": row[8],
+                }
 
-    def get_team_players(self, team_name: str) -> List[Dict[str, object]]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                """SELECT player_name, purchase_price FROM auction_players
-                   WHERE team_name = ? ORDER BY player_name COLLATE NOCASE""",
-                (team_name,),
+            rows = conn.execute(
+                "SELECT * FROM player_stats"
             ).fetchall()
-        return [{"player": player_name, "purchase_price": purchase_price} for player_name, purchase_price in rows]
 
-    def clear_tournament(self) -> None:
-        with self._connect() as connection:
-            connection.execute("DELETE FROM auction_players")
-            connection.execute("DELETE FROM auction_teams")
+            for row in rows:
+                data["players"][row[0]] = {
+                    "runs": row[1],
+                    "wickets": row[2],
+                    "matches": row[3],
+                    "balls_faced": row[4],
+                    "runs_conceded": row[5],
+                    "balls_bowled": row[6],
+                }
+        rows = conn.execute("SELECT data FROM matches").fetchall()
 
+        for row in rows:
+            data["matches"].append(json.loads(row[0]))
+        return data
 
 def _get_match_overs(match_data: Dict[str, object]) -> float:
     if "overs" in match_data and match_data.get("overs") is not None:
@@ -350,7 +470,7 @@ def _get_match_quota_balls(match_data: Dict[str, object]) -> int:
     return int(round(_get_match_overs(match_data) * _get_balls_per_over(match_data)))
 
 
-def _overs_notation_to_balls(value: object) -> int:
+def _overs_notation_to_balls(value: object, balls_per_over: int = 6) -> int:
     """Convert cricket overs notation (for example, ``18.2``) to balls.
 
     The digit after the decimal point is a ball count, not a decimal fraction
@@ -363,9 +483,9 @@ def _overs_notation_to_balls(value: object) -> int:
 
     whole, separator, balls = text.partition(".")
     balls_in_over = int(balls) if separator else 0
-    if balls_in_over > 5:
+    if balls_in_over >= balls_per_over:
         raise ValueError(f"Invalid ball count in overs value: {value!r}")
-    return int(whole) * 6 + balls_in_over
+    return int(whole) * balls_per_over + balls_in_over
 
 
 def _innings_balls(innings: Dict[str, object], payload: Dict[str, object], fallback_key: str) -> int:
@@ -373,7 +493,7 @@ def _innings_balls(innings: Dict[str, object], payload: Dict[str, object], fallb
     if innings.get("balls") is not None:
         return int(innings["balls"])
     if innings.get("overs") is not None:
-        return _overs_notation_to_balls(innings["overs"])
+        return _overs_notation_to_balls(innings["overs"],_get_balls_per_over(payload))
     return int(payload.get(fallback_key, 0))
 
 
@@ -497,7 +617,7 @@ def _parse_scorecard_text(text: str) -> Optional[Dict[str, object]]:
             continue
         score = int(total_match.group("runs"))
         wickets = int(total_match.group("wkts"))
-        balls = _overs_notation_to_balls(total_match.group("overs"))
+        balls = _overs_notation_to_balls(total_match.group("overs"),5 if "HUNDRED" in text.upper() else 6)
         players_payload: Dict[str, Dict[str, int]] = {}
         for line in innings["section"].splitlines():
             bowler_match = re.match(
@@ -674,6 +794,34 @@ def build_match_prompt() -> str:
         "Each player entry must include runs, balls_faced, wickets, runs_conceded, and balls_bowled."
     )
 
+def build_match_JsonSample() -> str:
+    example_payload = json.dumps({
+            "match_type": "T20I",
+            "overs": 20,
+            "team1": "Team 1",
+            "team2": "Team 2",
+            "score1": 180,
+            "wickets1": 6,
+            "balls1": 120,
+            "score2": 175,
+            "wickets2": 7,
+            "balls2": 110,
+            "players": {
+                "Team 1": {
+                    "Player One": {"runs": 80, "balls_faced": 70, "wickets": 0, "runs_conceded": 0, "balls_bowled": 0},
+                    "Player Two": {"runs": 50, "balls_faced": 40, "wickets": 1, "runs_conceded": 10, "balls_bowled": 4},
+                },
+                "Team 2": {
+                    "Player Three": {"runs": 60, "balls_faced": 50, "wickets": 0, "runs_conceded": 0, "balls_bowled": 0},
+                    "Player Four": {"runs": 20, "balls_faced": 10, "wickets": 2, "runs_conceded": 18, "balls_bowled": 12},
+                },
+            },
+        }, indent=2)
+    return (
+        "Sample JSON:\n"
+                f"```json\n{example_payload}\n```"
+    )
+        
 
 def get_caps_leaders(players: Dict[str, Dict[str, Any]], cap_type: str, top_n: int = 10) -> List[Dict[str, Any]]:
     if cap_type == "orange":
@@ -751,7 +899,13 @@ def format_caps(players: Dict[str, Dict[str, Any]], top_n: int = 10) -> str:
 
 
 state = TournamentState()
-tournament_db = TournamentDatabase(DATABASE_PATH)
+database = TournamentDatabase(DATABASE_PATH)
+print(f"Database loaded: {DATABASE_PATH}")
+print(os.path.exists(DATABASE_PATH))
+saved = database.load_all()
+
+state.teams = saved["teams"]
+state.players = saved["players"]
 # Stores admins who clicked "Add Match" and are allowed to send one JSON
 waiting_for_match: Dict[int, bool] = {}
 
@@ -760,7 +914,6 @@ waiting_for_match: Dict[int, bool] = {}
 # Example: MATCH_TOPIC_ID = 123456
 # Set to None to allow any topic.
 MATCH_TOPIC_ID = None
-squad_team_tokens: Dict[str, str] = {}
 for admin_id in parse_admin_ids(ADMIN_USER_IDS):
     state.set_admin(admin_id)
 
@@ -770,43 +923,17 @@ def _is_match_payload(text: str) -> bool:
 
 
 def build_help() -> str:
-    example_payload = json.dumps({
-        "match_type": "T20I",
-        "overs": 20,
-        "team1": "Team 1",
-        "team2": "Team 2",
-        "score1": 180,
-        "wickets1": 6,
-        "balls1": 120,
-        "score2": 175,
-        "wickets2": 7,
-        "balls2": 110,
-        "players": {
-            "Team 1": {
-                "Player One": {"runs": 80, "balls_faced": 70, "wickets": 0, "runs_conceded": 0, "balls_bowled": 0},
-                "Player Two": {"runs": 50, "balls_faced": 40, "wickets": 1, "runs_conceded": 10, "balls_bowled": 4},
-            },
-            "Team 2": {
-                "Player Three": {"runs": 60, "balls_faced": 50, "wickets": 0, "runs_conceded": 0, "balls_bowled": 0},
-                "Player Four": {"runs": 20, "balls_faced": 10, "wickets": 2, "runs_conceded": 18, "balls_bowled": 12},
-            },
-        },
-    }, indent=2)
+    
     return (
         "Send only JSON match data.\n"
         "Buttons:\n"
         "/start - welcome message\n"
         "/standings - view the points table\n"
         "/caps - show purple cap and orange cap leaders\n"
-        "/squads - view teams, players, and purchase prices\n"
-        "/addteam <team name> - admin: add an auction team\n"
-        "/addplayer <team> | <player> | <price> - admin: save or update a player purchase\n"
         "Admins can use End tournament to clear data after confirmation.\n"
         "/help - show this help\n\n"
-        "Copy-paste prompt for the AI:\n"
-        f"{build_match_prompt()}\n\n"
-        "Example JSON:\n"
-        f"```json\n{example_payload}\n```"
+        "/Prompt - Display prompt for generating match JSON for copy paste \n"
+        "/JsonSample - Display Json Sample expecting \n"
     )
 
 
@@ -821,8 +948,8 @@ def build_main_keyboard(user_id: Optional[int] = None) -> Any:
         ],
         [
             InlineKeyboardButton("Prompt", callback_data="prompt"),
+            InlineKeyboardButton("JsonSample", callback_data="JsonSample"),
             InlineKeyboardButton("➕Match", callback_data="add_match"),
-            InlineKeyboardButton("Squads", callback_data="squads"),
         ],
     ]
     if user_id is not None and state.is_admin(user_id):
@@ -837,71 +964,6 @@ def build_clear_confirmation_keyboard() -> Any:
         InlineKeyboardButton("Yes, clear tournament data", callback_data="confirm_clear_tournament"),
         InlineKeyboardButton("Cancel", callback_data="cancel_clear_tournament"),
     ]])
-
-
-def format_squads(rows: List[Dict[str, object]]) -> str:
-    if not rows:
-        return "No auction teams or players have been added yet."
-
-    lines = ["Tournament Squads", ""]
-    current_team: Optional[str] = None
-    for row in rows:
-        team_name = str(row["team"])
-        if team_name != current_team:
-            if current_team is not None:
-                lines.append("")
-            lines.append(team_name)
-            current_team = team_name
-        player_name = row["player"]
-        if player_name is None:
-            lines.append("  No players added yet.")
-        else:
-            lines.append(f"  {player_name} — Price: {float(row['purchase_price']):,.2f}")
-    return "\n".join(lines)
-
-
-def format_team_squad(team_name: str, players: List[Dict[str, object]]) -> str:
-    if not players:
-        return f"{team_name}\n\nNo players added yet."
-    lines = [team_name, ""]
-    for player in players:
-        price = float(player["purchase_price"])
-        price_text = str(int(price)) if price.is_integer() else str(price)
-        lines.append(f"{player['player']} | {price_text}")
-    return "\n".join(lines)
-
-
-def _team_callback_token(team_name: str) -> str:
-    token = hashlib.sha256(team_name.casefold().encode("utf-8")).hexdigest()[:24]
-    squad_team_tokens[token] = team_name
-    return token
-
-
-def build_squads_keyboard(team_names: List[str]) -> Any:
-    if InlineKeyboardButton is None or InlineKeyboardMarkup is None:
-        return None
-    rows = [[
-        InlineKeyboardButton(team_name, callback_data=f"squad_team_{_team_callback_token(team_name)}")
-    ] for team_name in team_names]
-    rows.append([InlineKeyboardButton("Back", callback_data="standings")])
-    return InlineKeyboardMarkup(rows)
-
-
-def build_squad_back_keyboard() -> Any:
-    if InlineKeyboardButton is None or InlineKeyboardMarkup is None:
-        return None
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("Back to teams", callback_data="squads"),
-    ]])
-
-
-def _parse_purchase_price(value: str) -> float:
-    cleaned = value.strip().replace(",", "")
-    cleaned = re.sub(r"^(?:₹|rs\.?|inr)\s*", "", cleaned, flags=re.IGNORECASE)
-    price = float(cleaned)
-    if price < 0:
-        raise ValueError("price must not be negative")
-    return price
 
 
 def handle_message(text: str, user_id: Optional[int] = None) -> str:
@@ -927,9 +989,17 @@ def handle_message(text: str, user_id: Optional[int] = None) -> str:
     match_data = parse_match(text)
     if match_data:
         state.apply_match(match_data)
+        database.save_match(match_data)
+
+        for team, stats in state.teams.items():
+            database.save_standing(team, stats)
+
+        for player, stats in state.players.items():
+            database.save_player_stat(player, stats)
+
         return f"✅ Match added successfully.\n\n{format_standings(state.get_standings())}"
 
-    return "⚠️ Please send valid JSON match data. Use /help for the template."
+    return "⚠️ Please send valid JSON match data. Use /prompt for the template."
 
 
 async def start_command(update: Any, context: Any) -> None:
@@ -953,60 +1023,6 @@ async def standings_command(update: Any, context: Any) -> None:
 async def caps_command(update: Any, context: Any) -> None:
     user_id = getattr(getattr(update.message, "from_user", None), "id", None)
     await update.message.reply_text(format_caps(state.players), reply_markup=build_main_keyboard(user_id))
-
-
-async def squads_command(update: Any, context: Any) -> None:
-    user_id = getattr(getattr(update.message, "from_user", None), "id", None)
-    team_names = tournament_db.get_team_names()
-    if not team_names:
-        text = "No auction teams or players have been added yet."
-        keyboard = build_main_keyboard(user_id)
-    else:
-        text = "Choose a team to view its players and purchase prices."
-        keyboard = build_squads_keyboard(team_names)
-    await update.message.reply_text(text, reply_markup=keyboard)
-
-
-async def add_team_command(update: Any, context: Any) -> None:
-    user_id = getattr(getattr(update.message, "from_user", None), "id", None)
-    if user_id is None or not state.is_admin(user_id):
-        await update.message.reply_text("Only an admin can add tournament teams.")
-        return
-
-    team_name = " ".join(context.args).strip()
-    if not team_name:
-        await update.message.reply_text("Usage: /addteam <team name>")
-        return
-    if tournament_db.add_team(team_name):
-        await update.message.reply_text(f"Team added: {team_name}", reply_markup=build_main_keyboard(user_id))
-    else:
-        await update.message.reply_text(f"{team_name} is already in the tournament.")
-
-
-async def add_player_command(update: Any, context: Any) -> None:
-    user_id = getattr(getattr(update.message, "from_user", None), "id", None)
-    if user_id is None or not state.is_admin(user_id):
-        await update.message.reply_text("Only an admin can add players and purchase prices.")
-        return
-
-    raw_value = " ".join(context.args)
-    parts = [part.strip() for part in raw_value.split("|")]
-    if len(parts) != 3 or not all(parts):
-        await update.message.reply_text("Usage: /addplayer <team> | <player> | <price>")
-        return
-    team_name, player_name, raw_price = parts
-    try:
-        purchase_price = _parse_purchase_price(raw_price)
-    except ValueError:
-        await update.message.reply_text("Enter a valid non-negative price, for example: 250000")
-        return
-    if not tournament_db.add_player(team_name, player_name, purchase_price):
-        await update.message.reply_text(f"Team '{team_name}' does not exist. Add it first with /addteam.")
-        return
-    await update.message.reply_text(
-        f"Saved {player_name} for {team_name} at {purchase_price:,.2f}.",
-        reply_markup=build_main_keyboard(user_id),
-    )
 
 
 async def set_admin_command(update: Any, context: Any) -> None:
@@ -1041,42 +1057,19 @@ async def handle_callback_query(update: Any, context: Any) -> None:
 
     if data == "standings":
         text = format_standings(state.get_standings())
-        await query.answer(text="Showing standings")
         await query.message.reply_text(text, reply_markup=build_main_keyboard(user_id))
     elif data == "caps":
         text = format_caps(state.players)
-        await query.answer(text="Showing caps")
         await query.message.reply_text(text, reply_markup=build_main_keyboard(user_id))
-    elif data == "squads":
-        team_names = tournament_db.get_team_names()
-        text = "Choose a team to view its players and purchase prices." if team_names else "No auction teams or players have been added yet."
-        await query.answer(text="Showing squads")
-        await query.message.reply_text(
-            text,
-            reply_markup=build_squads_keyboard(team_names) if team_names else build_main_keyboard(user_id),
-        )
-    elif data.startswith("squad_team_"):
-        token = data.removeprefix("squad_team_")
-        team_name = squad_team_tokens.get(token)
-        if team_name is None:
-            await query.message.reply_text("That team selection has expired. Please open Squads again.")
-            return
-        text = format_team_squad(team_name, tournament_db.get_team_players(team_name))
-        await query.message.reply_text(text, reply_markup=build_squad_back_keyboard())
-    elif data == "squads_back":
-        await query.message.reply_text(
-            "Choose a team to view its players and purchase prices.",
-            reply_markup=build_squads_keyboard(tournament_db.get_team_names()),
-        )
     elif data == "help":
         text = build_help()
-        await query.answer(text="Showing help")
         await query.message.reply_text(text, reply_markup=build_main_keyboard(user_id))
     elif data == "prompt":
         text = "Prompt:\n\n" + build_match_prompt()
-        await query.answer(text="Prompt ready")
         await query.message.reply_text(text, reply_markup=build_main_keyboard(user_id))
-        
+    elif data == "JsonSample":
+        text = "Sample:\n\n" + build_match_JsonSample()
+        await query.message.reply_text(text, reply_markup=build_main_keyboard(user_id))  
     elif data == "add_match":
 
         if user_id is None or not state.is_admin(user_id):
@@ -1117,7 +1110,7 @@ async def handle_callback_query(update: Any, context: Any) -> None:
             await query.message.reply_text("Only an admin can clear tournament data.")
             return
         state.clear_tournament()
-        tournament_db.clear_tournament()
+        database.clear_tournament()
         await query.message.reply_text(
             "Tournament data cleared. A new tournament is ready to begin.",
             reply_markup=build_main_keyboard(user_id),
@@ -1129,7 +1122,6 @@ async def handle_callback_query(update: Any, context: Any) -> None:
         )
     else:
         text = "Choose an option below."
-        await query.answer(text="Main menu")
         await query.message.reply_text(text, reply_markup=build_main_keyboard(user_id))
 
 
@@ -1148,6 +1140,44 @@ def run_console() -> None:
             break
         print(handle_message(text))
 
+async def handle_text_message(update, context) -> None:
+    if not update.message or not update.message.text:
+        return
+
+    if MATCH_TOPIC_ID is not None:
+        if update.message.message_thread_id != MATCH_TOPIC_ID:
+            return
+
+    user_id = update.message.from_user.id if update.message.from_user else None
+
+    # Ignore every message unless admin clicked Add Match
+    if user_id not in waiting_for_match:
+        return
+
+    text = update.message.text
+
+    # Accept only ONE message
+    waiting_for_match.pop(user_id, None)
+
+    match_data = parse_match(text)
+
+    if match_data:
+        state.apply_match(match_data)
+        database.save_match(match_data)
+        for team, stats in state.teams.items():
+            database.save_standing(team, stats)
+
+        for player, stats in state.players.items():
+            database.save_player_stat(player, stats)
+        await update.message.reply_text(
+            f"✅ Match added successfully.\n\n"
+            f"{format_standings(state.get_standings())}",
+            reply_markup=build_main_keyboard(user_id)
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Invalid match JSON.\nUse /help for the correct format."
+        )
 
 def main() -> None:
     if not TOKEN:
@@ -1165,9 +1195,6 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("standings", standings_command))
     app.add_handler(CommandHandler("caps", caps_command))
-    app.add_handler(CommandHandler("squads", squads_command))
-    app.add_handler(CommandHandler("addteam", add_team_command))
-    app.add_handler(CommandHandler("addplayer", add_player_command))
     app.add_handler(CommandHandler("setadmin", set_admin_command))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(
@@ -1180,36 +1207,5 @@ def main() -> None:
     print("Bot started. Press Ctrl+C to stop.")
     app.run_polling()
 
-async def handle_text_message(update, context) -> None:
-    async def handle_text_message(update, context) -> None:
-        if not update.message or not update.message.text:
-            return
-
-    user_id = update.message.from_user.id if update.message.from_user else None
-
-    # Ignore every message unless admin clicked Add Match
-    if user_id not in waiting_for_match:
-        return
-
-    text = update.message.text
-
-    # Remove waiting state so only ONE message is accepted
-    waiting_for_match.pop(user_id, None)
-
-    match_data = parse_match(text)
-
-    if match_data:
-        state.apply_match(match_data)
-
-        await update.message.reply_text(
-            f"✅ Match added successfully.\n\n"
-            f"{format_standings(state.get_standings())}",
-            reply_markup=build_main_keyboard(user_id)
-        )
-
-    else:
-        await update.message.reply_text(
-            "❌ Invalid match JSON.\nUse /help for the correct format."
-        )
 if __name__ == "__main__":
     main()
