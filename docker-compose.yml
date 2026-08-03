@@ -10,7 +10,7 @@ services:
       - .env
 
     volumes:
-      - tournament-data:/app/data
+      - ./data:/app/data
 
 volumes:
   tournament-data:
