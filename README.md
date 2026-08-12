@@ -1,3 +1,39 @@
+## Setup and Run
+
+```bash
+git init
+git remote add origin https://github.com/<your-username>/<your-repo>.git
+
+git pull origin main
+
+docker build -t telegram_crickbot .
+
+docker run -d --name crickbot \
+  --env-file .env \
+  -v ~/crickbot_data:/app/data \
+  telegram_crickbot
+
+##Logs
+docker logs -f crickbot
+
+```
+
+Make Sure to add .env file in the same directory of project folder
+
+```bash
+nano .env
+```
+
+✅ This gives a clear step‑by‑step workflow: initialize Git, pull the repo, build the Docker image, run with environment variables and volume mount, and check logs.  
+
+Would you like me to also add a **docker-compose section** in the README so users can run everything with a single `docker-compose up -d` instead of manual build/run commands?
+
+
+
+
+
+
+
 # Tournament Telegram Bot
 
 This bot lets you add match results and view a tournament table with:
