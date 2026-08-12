@@ -830,13 +830,14 @@ def parse_match(text: str) -> Optional[Dict[str, object]]:
 
 
 def build_match_prompt() -> str:
-    return (
+    instructions = (
         "Generate a single JSON object for the cricket match simulated above. Use the actual team and player names from the match details. "
         "Return only valid JSON with no markdown fences, explanations, or extra text. Required fields: match_type, team1, team2, score1, wickets1, balls1, score2, wickets2, balls2, players. "
         "balls1 and balls2 must be integer legal balls actually faced, never overs notation. For T20/ODI, include overs (for example 20 or 50); these use six balls per over. "
         "For The Hundred, set match_type to 'The Hundred', balls_per_innings to 100, and balls_per_over to 5. "
         "Each player entry must include runs, balls_faced, wickets, runs_conceded, and balls_bowled."
     )
+    return f"{instructions}\n\n{build_match_JsonSample()}"
 
 def build_match_JsonSample() -> str:
     example_payload = json.dumps({
@@ -942,6 +943,36 @@ def format_caps(players: Dict[str, Dict[str, Any]], top_n: int = 10) -> str:
     return "Orange Cap\n" + "\n".join(orange_lines) + "\n\nPurple Cap\n" + "\n".join(purple_lines)
 
 
+CAPS_PAGE_SIZE = 10
+
+
+def format_cap_page(
+    players: Dict[str, Dict[str, Any]], cap_type: str, page: int = 0, page_size: int = CAPS_PAGE_SIZE
+) -> tuple[str, int]:
+    """Format one numbered page of either cap leaderboard."""
+    if cap_type not in {"orange", "purple"}:
+        raise ValueError("cap_type must be 'orange' or 'purple'")
+    if not players:
+        return "No player stats recorded yet.", 1
+
+    leaders = get_caps_leaders(players, cap_type, top_n=len(players))
+    total_pages = max(1, (len(leaders) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    page_leaders = leaders[page * page_size : (page + 1) * page_size]
+    title = "Orange Cap" if cap_type == "orange" else "Purple Cap"
+    lines = [f"{title} (Page {page + 1}/{total_pages})", ""]
+
+    for rank, item in enumerate(page_leaders, start=page * page_size + 1):
+        if cap_type == "orange":
+            prefix = "🟠 " if rank == 1 else ""
+            lines.append(f"{rank}. {prefix}{item['name']}: {item['runs']} runs, SR {item['strike_rate']}")
+        else:
+            prefix = "🟣 " if rank == 1 else ""
+            lines.append(f"{rank}. {prefix}{item['name']}: {item['wickets']} wickets, Econ {item['economy']}")
+
+    return "\n".join(lines), total_pages
+
+
 state = TournamentState()
 database = TournamentDatabase(DATABASE_PATH)
 print(f"Database loaded: {DATABASE_PATH}")
@@ -974,11 +1005,12 @@ def build_help() -> str:
         "Buttons:\n"
         "/start - welcome message\n"
         "/standings - view the points table\n"
-        "/caps - show purple cap and orange cap leaders\n"
+        "/caps - choose an Orange Cap or Purple Cap leaderboard\n"
+        "/orangecap - show Orange Cap leaderboard\n"
+        "/purplecap - show Purple Cap leaderboard\n"
         "Admins can use End tournament to clear data after confirmation.\n"
         "/help - show this help\n\n"
-        "/Prompt - Display prompt for generating match JSON for copy paste \n"
-        "/JsonSample - Display Json Sample expecting \n"
+        "/Prompt - Display the complete prompt and JSON example for copy paste\n"
     )
 
 async def prompt_command(update, context):
@@ -987,12 +1019,6 @@ async def prompt_command(update, context):
         build_match_prompt()
     )
 
-
-async def jsonsample_command(update, context):
-
-    await update.message.reply_text(
-        build_match_JsonSample()
-    )
 
 def build_main_keyboard(user_id: Optional[int] = None) -> Any:
     if InlineKeyboardButton is None or InlineKeyboardMarkup is None:
@@ -1005,12 +1031,32 @@ def build_main_keyboard(user_id: Optional[int] = None) -> Any:
         ],
         [
             InlineKeyboardButton("Prompt", callback_data="prompt"),
-            InlineKeyboardButton("JsonSample", callback_data="JsonSample"),
             InlineKeyboardButton("➕Match", callback_data="add_match"),
         ],
     ]
     if user_id is not None and state.is_admin(user_id):
         rows.append([InlineKeyboardButton("End tournament", callback_data="end_tournament")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_cap_page_keyboard(cap_type: str, page: int, total_pages: int) -> Any:
+    if InlineKeyboardButton is None or InlineKeyboardMarkup is None:
+        return None
+
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton("Previous", callback_data=f"cap:{cap_type}:{page - 1}"))
+    if page < total_pages - 1:
+        navigation.append(InlineKeyboardButton("Next", callback_data=f"cap:{cap_type}:{page + 1}"))
+
+    rows = []
+    if navigation:
+        rows.append(navigation)
+    rows.append([
+        InlineKeyboardButton("Orange Cap", callback_data="cap:orange:0"),
+        InlineKeyboardButton("Purple Cap", callback_data="cap:purple:0"),
+    ])
+    rows.append([InlineKeyboardButton("Main menu", callback_data="main_menu")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1038,7 +1084,13 @@ def handle_message(text: str, user_id: Optional[int] = None) -> str:
         return format_standings(state.get_standings())
 
     if text.startswith("/caps"):
-        return format_caps(state.players)
+        return "Use /orangecap or /purplecap to view a leaderboard."
+
+    if text.startswith("/orangecap"):
+        return format_cap_page(state.players, "orange")[0]
+
+    if text.startswith("/purplecap"):
+        return format_cap_page(state.players, "purple")[0]
 
     if user_id is not None and not state.is_admin(user_id):
         return "⚠️ Only the admin can add match JSON."
@@ -1062,7 +1114,7 @@ def handle_message(text: str, user_id: Optional[int] = None) -> str:
 async def start_command(update: Any, context: Any) -> None:
     user_id = getattr(getattr(update.message, "from_user", None), "id", None)
     await update.message.reply_text(
-        "Welcome! Use the buttons below to manage the tournament.",
+        format_standings(state.get_standings()),
         reply_markup=build_main_keyboard(user_id),
     )
 
@@ -1078,8 +1130,20 @@ async def standings_command(update: Any, context: Any) -> None:
 
 
 async def caps_command(update: Any, context: Any) -> None:
-    user_id = getattr(getattr(update.message, "from_user", None), "id", None)
-    await update.message.reply_text(format_caps(state.players), reply_markup=build_main_keyboard(user_id))
+    await update.message.reply_text(
+        "Choose a leaderboard.",
+        reply_markup=build_cap_page_keyboard("orange", 0, 1),
+    )
+
+
+async def orange_cap_command(update: Any, context: Any) -> None:
+    text, total_pages = format_cap_page(state.players, "orange")
+    await update.message.reply_text(text, reply_markup=build_cap_page_keyboard("orange", 0, total_pages))
+
+
+async def purple_cap_command(update: Any, context: Any) -> None:
+    text, total_pages = format_cap_page(state.players, "purple")
+    await update.message.reply_text(text, reply_markup=build_cap_page_keyboard("purple", 0, total_pages))
 
 
 async def set_admin_command(update: Any, context: Any) -> None:
@@ -1114,21 +1178,40 @@ async def handle_callback_query(update: Any, context: Any) -> None:
     data = query.data or ""
     user_id = getattr(getattr(query, "from_user", None), "id", None)
     
-    if data == "standings":
+    if data.startswith("cap:"):
+        try:
+            _, cap_type, page_text = data.split(":", 2)
+            page = int(page_text)
+            text, total_pages = format_cap_page(state.players, cap_type, page)
+            page = max(0, min(page, total_pages - 1))
+        except (TypeError, ValueError):
+            await query.message.reply_text("Unable to open that leaderboard page.")
+            return
+        if getattr(query.message, "text", None) == text:
+            return
+        await query.edit_message_text(
+            text,
+            reply_markup=build_cap_page_keyboard(cap_type, page, total_pages),
+        )
+    elif data == "main_menu":
+        await query.edit_message_text(
+            format_standings(state.get_standings()),
+            reply_markup=build_main_keyboard(user_id),
+        )
+    elif data == "standings":
         text = format_standings(state.get_standings())
         await query.message.reply_text(text, reply_markup=build_main_keyboard(user_id))
     elif data == "caps":
-        text = format_caps(state.players)
-        await query.message.reply_text(text, reply_markup=build_main_keyboard(user_id))
+        await query.message.reply_text(
+            "Choose a leaderboard.",
+            reply_markup=build_cap_page_keyboard("orange", 0, 1),
+        )
     elif data == "help":
         text = build_help()
         await query.message.reply_text(text, reply_markup=build_main_keyboard(user_id))
     elif data == "prompt":
-        text = "Prompt:\n\n" + build_match_prompt()
+        text = "Prompt and JSON example:\n\n" + build_match_prompt()
         await query.message.reply_text(text, reply_markup=build_main_keyboard(user_id))
-    elif data == "JsonSample":
-        text = "Sample:\n\n" + build_match_JsonSample()
-        await query.message.reply_text(text, reply_markup=build_main_keyboard(user_id))  
     elif data == "add_match":
 
         if user_id is None or not state.is_admin(user_id):
@@ -1254,6 +1337,8 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("standings", standings_command))
     app.add_handler(CommandHandler("caps", caps_command))
+    app.add_handler(CommandHandler("orangecap", orange_cap_command))
+    app.add_handler(CommandHandler("purplecap", purple_cap_command))
     app.add_handler(CommandHandler("setadmin", set_admin_command))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(
@@ -1263,13 +1348,6 @@ def main() -> None:
         )
     )
 
-
-    app.add_handler(
-        CommandHandler(
-            "jsonsample",
-            jsonsample_command
-        )
-    )
     app.add_handler(
     MessageHandler(
         filters.TEXT & ~filters.COMMAND,

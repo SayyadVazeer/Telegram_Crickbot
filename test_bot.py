@@ -112,6 +112,29 @@ TOTAL (18.2 overs, 10 wkts) 98 CRR: 5.40"""
         prompt = bot.build_match_prompt()
         self.assertIn("balls_per_innings to 100", prompt)
         self.assertIn("balls_per_over to 5", prompt)
+        self.assertIn("Sample JSON:", prompt)
+
+    def test_cap_pages_show_ten_players_and_keep_global_ranks(self) -> None:
+        players = {
+            f"Player {number}": {
+                "runs": 130 - number,
+                "balls_faced": 100,
+                "wickets": 0,
+                "runs_conceded": 0,
+                "balls_bowled": 0,
+            }
+            for number in range(1, 13)
+        }
+
+        first_page, total_pages = bot.format_cap_page(players, "orange", page=0)
+        second_page, _ = bot.format_cap_page(players, "orange", page=1)
+
+        self.assertEqual(total_pages, 2)
+        self.assertIn("1. 🟠 Player 1", first_page)
+        self.assertIn("10. Player 10", first_page)
+        self.assertNotIn("11. Player 11", first_page)
+        self.assertIn("11. Player 11", second_page)
+        self.assertIn("12. Player 12", second_page)
 
     def test_player_caps_are_tracked(self) -> None:
         parsed = bot.parse_match(
