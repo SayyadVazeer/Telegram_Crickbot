@@ -83,8 +83,67 @@ TOTAL (18.2 overs, 10 wkts) 98 CRR: 5.40"""
             "balls2": 75,
             "players": {},
         })
-        # The Hundred uses 20 five-ball sets: 100/20 - 101/15.
+        # Hundred NRR is expressed per five-ball set: 100/20 - 101/15.
         self.assertAlmostEqual(state.teams["Oval Invincibles"]["net_run_rate"], -1.733)
+        self.assertEqual(state.teams["Southern Brave"]["points"], 2)
+
+    def test_nrr_supports_configured_five_and_six_ball_overs(self) -> None:
+        six_ball = bot.TournamentState()
+        six_ball.apply_match({
+            "overs": 20, "team1": "Six A", "team2": "Six B",
+            "score1": 120, "wickets1": 5, "balls1": 120,
+            "score2": 100, "wickets2": 5, "balls2": 120, "players": {},
+        })
+        self.assertAlmostEqual(six_ball.teams["Six A"]["net_run_rate"], 1.0)
+
+        five_ball = bot.TournamentState()
+        five_ball.apply_match({
+            "overs": 20, "balls_per_over": 5, "team1": "Five A", "team2": "Five B",
+            "score1": 100, "wickets1": 5, "balls1": 100,
+            "score2": 80, "wickets2": 5, "balls2": 100, "players": {},
+        })
+        self.assertAlmostEqual(five_ball.teams["Five A"]["net_run_rate"], 1.0)
+
+    def test_no_result_is_excluded_from_nrr(self) -> None:
+        state = bot.TournamentState()
+        state.apply_match({
+            "overs": 20, "team1": "A", "team2": "B",
+            "score1": 100, "wickets1": 5, "balls1": 120,
+            "score2": 80, "wickets2": 5, "balls2": 120, "players": {},
+        })
+        state.apply_match({
+            "overs": 20, "team1": "A", "team2": "C",
+            "score1": 200, "wickets1": 5, "balls1": 120,
+            "score2": 0, "wickets2": 0, "balls2": 1,
+            "exclude_from_nrr": True, "players": {},
+        })
+        self.assertAlmostEqual(state.teams["A"]["net_run_rate"], 1.0)
+
+    def test_mixed_over_formats_are_rejected_after_first_match(self) -> None:
+        state = bot.TournamentState()
+        state.apply_match({
+            "overs": 20, "team1": "A", "team2": "B",
+            "score1": 100, "wickets1": 5, "balls1": 120,
+            "score2": 90, "wickets2": 5, "balls2": 120, "players": {},
+        })
+        with self.assertRaises(ValueError):
+            state.apply_match({
+                "match_type": "The Hundred", "team1": "A", "team2": "C",
+                "score1": 100, "wickets1": 5, "balls1": 100,
+                "score2": 90, "wickets2": 5, "balls2": 100, "players": {},
+            })
+
+    def test_no_result_awards_one_point_without_changing_nrr(self) -> None:
+        state = bot.TournamentState()
+        state.apply_match({
+            "overs": 20, "team1": "A", "team2": "B",
+            "score1": 0, "wickets1": 0, "balls1": 0,
+            "score2": 0, "wickets2": 0, "balls2": 0,
+            "result_type": "no_result", "exclude_from_nrr": True, "players": {},
+        })
+        self.assertEqual(state.teams["A"]["points"], 1)
+        self.assertEqual(state.teams["B"]["points"], 1)
+        self.assertEqual(state.teams["A"]["net_run_rate"], 0.0)
 
     def test_json_match_format_is_preserved_for_nrr(self) -> None:
         parsed = bot.parse_match(json.dumps({
@@ -108,11 +167,44 @@ TOTAL (18.2 overs, 10 wkts) 98 CRR: 5.40"""
         state.apply_match(parsed)
         self.assertAlmostEqual(state.teams["A"]["net_run_rate"], -1.733)
 
+    def test_dls_nrr_uses_officially_accredited_inputs(self) -> None:
+        state = bot.TournamentState()
+        state.apply_match({
+            "match_type": "The Hundred", "team1": "A", "team2": "B",
+            "score1": 120, "wickets1": 5, "balls1": 100,
+            "score2": 81, "wickets2": 3, "balls2": 60,
+            "nrr_score1": 80, "nrr_balls1": 60,
+            "nrr_score2": 81, "nrr_balls2": 60,
+            "players": {},
+        })
+        self.assertAlmostEqual(state.teams["A"]["net_run_rate"], -0.083)
+
     def test_match_prompt_requests_the_hundred_metadata(self) -> None:
         prompt = bot.build_match_prompt()
         self.assertIn("balls_per_innings to 100", prompt)
         self.assertIn("balls_per_over to 5", prompt)
         self.assertIn("Sample JSON:", prompt)
+        self.assertIn("first match locks the tournament NRR format", prompt)
+        self.assertIn("Never include Super Over runs or balls", prompt)
+
+    def test_match_json_validation_requires_format_and_player_fields(self) -> None:
+        incomplete = json.dumps({
+            "match_type": "T20I", "team1": "A", "team2": "B",
+            "score1": 100, "wickets1": 5, "balls1": 120,
+            "score2": 90, "wickets2": 5, "balls2": 120, "players": {},
+        })
+        complete = json.dumps({
+            "match_type": "T20I", "balls_per_over": 6, "balls_per_innings": 120,
+            "team1": "A", "team2": "B", "score1": 100, "wickets1": 5, "balls1": 120,
+            "score2": 90, "wickets2": 5, "balls2": 120,
+            "players": {
+                "A": {"A Player": {"runs": 50, "balls_faced": 40, "wickets": 0, "runs_conceded": 0, "balls_bowled": 0}},
+                "B": {"B Player": {"runs": 40, "balls_faced": 35, "wickets": 1, "runs_conceded": 20, "balls_bowled": 12}},
+            },
+        })
+
+        self.assertIn("balls_per_innings", bot.validate_match_json(incomplete) or "")
+        self.assertIsNone(bot.validate_match_json(complete))
 
     def test_cap_pages_show_ten_players_and_keep_global_ranks(self) -> None:
         players = {
@@ -264,6 +356,29 @@ Naseem Shah                3.1     14     3         4.42"""
         self.assertEqual([item["name"] for item in orange], ["B", "A", "C"])
         self.assertEqual([item["name"] for item in purple], ["C", "A", "B"])
 
+    def test_caps_exclude_players_without_relevant_participation(self) -> None:
+        players = {
+            "Batter": {"runs": 20, "balls_faced": 10, "wickets": 0, "runs_conceded": 0, "balls_bowled": 0},
+            "Bowler": {"runs": 0, "balls_faced": 0, "wickets": 1, "runs_conceded": 12, "balls_bowled": 6},
+            "Did Not Bat": {"runs": 0, "balls_faced": 0, "wickets": 0, "runs_conceded": 0, "balls_bowled": 0},
+            "Did Not Bowl": {"runs": 5, "balls_faced": 2, "wickets": 1, "runs_conceded": 0, "balls_bowled": 0},
+        }
+
+        orange = bot.get_caps_leaders(players, "orange")
+        purple = bot.get_caps_leaders(players, "purple")
+
+        self.assertEqual([player["name"] for player in orange], ["Batter", "Did Not Bowl"])
+        self.assertEqual([player["name"] for player in purple], ["Bowler"])
+
+    def test_empty_cap_page_explains_eligibility_requirement(self) -> None:
+        text, total_pages = bot.format_cap_page(
+            {"Did Not Play": {"runs": 0, "balls_faced": 0, "wickets": 0, "runs_conceded": 0, "balls_bowled": 0}},
+            "purple",
+        )
+
+        self.assertEqual(total_pages, 1)
+        self.assertEqual(text, "No eligible players yet. No player has bowled a ball.")
+
     def test_standings_format_excludes_runs_wickets_and_strike_rate(self) -> None:
         standings = [{
             "team": "India",
@@ -339,6 +454,16 @@ Naseem Shah                3.1     14     3         4.42"""
 
         database.clear_tournament()
         self.assertEqual(database.get_squads(), [])
+
+    def test_database_can_delete_the_last_match_only(self) -> None:
+        database = bot.TournamentDatabase(":memory:")
+        first_match = {"team1": "A", "team2": "B", "score1": 100, "score2": 90, "wickets1": 5, "wickets2": 6, "balls1": 120, "balls2": 120}
+        second_match = {"team1": "C", "team2": "D", "score1": 110, "score2": 100, "wickets1": 5, "wickets2": 6, "balls1": 120, "balls2": 120}
+        database.save_match(first_match)
+        database.save_match(second_match)
+
+        self.assertEqual(database.delete_last_match(), second_match)
+        self.assertEqual(database.load_all()["matches"], [first_match])
 
     def test_parse_admin_ids_supports_multiple_values(self) -> None:
         self.assertEqual(bot.parse_admin_ids("123,456"), {123, 456})

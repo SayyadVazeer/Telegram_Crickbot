@@ -62,6 +62,9 @@ class TournamentState:
         self.players: Dict[str, Dict[str, float]] = {}
         self.matches: List[Dict[str, object]] = []
         self.admin_ids: set[int] = set()
+        # NRR format is locked from the first recorded match in a tournament.
+        self.nrr_balls_per_over: Optional[int] = None
+        self.nrr_quota_balls: Optional[int] = None
 
     def set_admin(self, user_id: int) -> None:
         self.admin_ids.add(user_id)
@@ -74,6 +77,8 @@ class TournamentState:
         self.teams.clear()
         self.players.clear()
         self.matches.clear()
+        self.nrr_balls_per_over = None
+        self.nrr_quota_balls = None
 
 
     def add_team(self, name: str) -> None:
@@ -95,6 +100,11 @@ class TournamentState:
                 "run_rate": 0.0,
                 "strike_rate": 0.0,
                 "net_run_rate": 0.0,
+                "nrr_runs_scored": 0,
+                "nrr_runs_conceded": 0,
+                "nrr_balls_faced": 0,
+                "nrr_balls_bowled": 0,
+                "nrr_rate_unit_balls": 6,
             }
 
     def add_player(self, name: str) -> None:
@@ -113,8 +123,21 @@ class TournamentState:
         team2 = str(match_data["team2"])
         quota_balls = _get_match_quota_balls(match_data)
         balls_per_over = _get_balls_per_over(match_data)
+        if self.nrr_balls_per_over is not None and balls_per_over != self.nrr_balls_per_over:
+            raise ValueError(
+                f"This tournament uses {self.nrr_balls_per_over}-ball overs; "
+                f"cannot add a {balls_per_over}-ball match."
+            )
+        if self.nrr_balls_per_over is None:
+            self.nrr_balls_per_over = balls_per_over
+            self.nrr_quota_balls = quota_balls
+        nrr_rate_unit_balls = self.nrr_balls_per_over
+        nrr_quota_balls = int(match_data.get("nrr_quota_balls", self.nrr_quota_balls))
+        counts_for_nrr = not bool(match_data.get("exclude_from_nrr", False))
         self.add_team(team1)
         self.add_team(team2)
+        self.teams[team1]["nrr_rate_unit_balls"] = nrr_rate_unit_balls
+        self.teams[team2]["nrr_rate_unit_balls"] = nrr_rate_unit_balls
 
         self.teams[team1]["played"] += 1
         self.teams[team2]["played"] += 1
@@ -125,6 +148,10 @@ class TournamentState:
         wickets2 = int(match_data["wickets2"])
         balls1 = int(match_data["balls1"])
         balls2 = int(match_data["balls2"])
+        nrr_score1 = int(match_data.get("nrr_score1", score1))
+        nrr_score2 = int(match_data.get("nrr_score2", score2))
+        nrr_balls1 = int(match_data.get("nrr_balls1", balls1))
+        nrr_balls2 = int(match_data.get("nrr_balls2", balls2))
 
         self.teams[team1]["runs_scored"] += score1
         self.teams[team1]["runs_conceded"] += score2
@@ -132,6 +159,11 @@ class TournamentState:
         self.teams[team1]["wickets_lost"] += wickets1
         self.teams[team1]["balls_faced"] += balls1
         self.teams[team1]["balls_bowled"] += balls2
+        if counts_for_nrr:
+            self.teams[team1]["nrr_runs_scored"] += nrr_score1
+            self.teams[team1]["nrr_runs_conceded"] += nrr_score2
+            self.teams[team1]["nrr_balls_faced"] += nrr_balls1
+            self.teams[team1]["nrr_balls_bowled"] += nrr_balls2
 
         self.teams[team2]["runs_scored"] += score2
         self.teams[team2]["runs_conceded"] += score1
@@ -139,14 +171,25 @@ class TournamentState:
         self.teams[team2]["wickets_lost"] += wickets2
         self.teams[team2]["balls_faced"] += balls2
         self.teams[team2]["balls_bowled"] += balls1
+        if counts_for_nrr:
+            self.teams[team2]["nrr_runs_scored"] += nrr_score2
+            self.teams[team2]["nrr_runs_conceded"] += nrr_score1
+            self.teams[team2]["nrr_balls_faced"] += nrr_balls2
+            self.teams[team2]["nrr_balls_bowled"] += nrr_balls1
 
         overs1 = balls1 / balls_per_over
         overs2 = balls2 / balls_per_over
         quota_overs = quota_balls / balls_per_over
-        if wickets1 >= 10 and balls1 < quota_balls:
+        if counts_for_nrr and wickets1 >= 10 and nrr_balls1 < nrr_quota_balls:
             overs1 = quota_overs
-        if wickets2 >= 10 and balls2 < quota_balls:
+            nrr_balls1 = nrr_quota_balls
+            self.teams[team1]["nrr_balls_faced"] += nrr_quota_balls - int(match_data.get("nrr_balls1", balls1))
+            self.teams[team2]["nrr_balls_bowled"] += nrr_quota_balls - int(match_data.get("nrr_balls1", balls1))
+        if counts_for_nrr and wickets2 >= 10 and nrr_balls2 < nrr_quota_balls:
             overs2 = quota_overs
+            nrr_balls2 = nrr_quota_balls
+            self.teams[team2]["nrr_balls_faced"] += nrr_quota_balls - int(match_data.get("nrr_balls2", balls2))
+            self.teams[team1]["nrr_balls_bowled"] += nrr_quota_balls - int(match_data.get("nrr_balls2", balls2))
 
         self.teams[team1]["overs_faced"] += overs1
         self.teams[team1]["overs_bowled"] += overs2
@@ -170,19 +213,26 @@ class TournamentState:
                     self.players[safe_name]["runs_conceded"] += int(stats.get("runs_conceded", 0))
                     self.players[safe_name]["balls_bowled"] += int(stats.get("balls_bowled", 0))
 
-        if score1 > score2:
+        win_points, tie_points = 2, 1
+        result_type = str(match_data.get("result_type", "normal")).lower()
+        if result_type == "no_result":
+            self.teams[team1]["draws"] += 1
+            self.teams[team2]["draws"] += 1
+            self.teams[team1]["points"] += tie_points
+            self.teams[team2]["points"] += tie_points
+        elif score1 > score2:
             self.teams[team1]["wins"] += 1
-            self.teams[team1]["points"] += 2
+            self.teams[team1]["points"] += win_points
             self.teams[team2]["losses"] += 1
         elif score2 > score1:
             self.teams[team2]["wins"] += 1
-            self.teams[team2]["points"] += 2
+            self.teams[team2]["points"] += win_points
             self.teams[team1]["losses"] += 1
         else:
             self.teams[team1]["draws"] += 1
             self.teams[team2]["draws"] += 1
-            self.teams[team1]["points"] += 1
-            self.teams[team2]["points"] += 1
+            self.teams[team1]["points"] += tie_points
+            self.teams[team2]["points"] += tie_points
 
         self._refresh_rates()
         self.matches.append(match_data)
@@ -196,7 +246,11 @@ class TournamentState:
 
             run_rate = stats["runs_scored"] / overs_faced if overs_faced else 0.0
             strike_rate = (stats["runs_scored"] / balls_faced * 100.0) if balls_faced else 0.0
-            nrr = (stats["runs_scored"] / overs_faced if overs_faced else 0.0) - (stats["runs_conceded"] / overs_bowled if overs_bowled else 0.0)
+            nrr_unit = float(stats["nrr_rate_unit_balls"])
+            nrr = nrr_unit * (
+                (stats["nrr_runs_scored"] / stats["nrr_balls_faced"] if stats["nrr_balls_faced"] else 0.0)
+                - (stats["nrr_runs_conceded"] / stats["nrr_balls_bowled"] if stats["nrr_balls_bowled"] else 0.0)
+            )
 
             stats["run_rate"] = round(run_rate, 2)
             stats["strike_rate"] = round(strike_rate, 2)
@@ -224,13 +278,21 @@ class TournamentState:
 class TournamentDatabase:
 
     def __init__(self, path):
-        self.path = path
+        self._connection_options: Dict[str, Any] = {}
+        self._memory_connection = None
+        if path == ":memory:":
+            self.path = f"file:tournament_{id(self)}?mode=memory&cache=shared"
+            self._connection_options = {"uri": True}
+            # Keep one connection open so the shared in-memory database persists.
+            self._memory_connection = sqlite3.connect(self.path, **self._connection_options)
+        else:
+            self.path = path
         directory = os.path.dirname(self.path)
 
         if directory:
             os.makedirs(directory, exist_ok=True)
 
-        with sqlite3.connect(self.path) as conn:
+        with self._connect() as conn:
             conn.executescript("""
             
             CREATE TABLE IF NOT EXISTS standings (
@@ -246,7 +308,12 @@ class TournamentDatabase:
                 balls_faced INTEGER DEFAULT 0,
                 balls_bowled INTEGER DEFAULT 0,
                 overs_faced REAL DEFAULT 0,
-                overs_bowled REAL DEFAULT 0
+                overs_bowled REAL DEFAULT 0,
+                nrr_runs_scored INTEGER DEFAULT 0,
+                nrr_runs_conceded INTEGER DEFAULT 0,
+                nrr_balls_faced INTEGER DEFAULT 0,
+                nrr_balls_bowled INTEGER DEFAULT 0,
+                nrr_rate_unit_balls INTEGER DEFAULT 6
             );
 
 
@@ -274,16 +341,92 @@ class TournamentDatabase:
                 data TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS squad_teams (
+                name TEXT PRIMARY KEY COLLATE NOCASE
+            );
+
+            CREATE TABLE IF NOT EXISTS squads (
+                team TEXT NOT NULL COLLATE NOCASE,
+                player TEXT NOT NULL,
+                price REAL NOT NULL,
+                PRIMARY KEY (team, player),
+                FOREIGN KEY (team) REFERENCES squad_teams(name)
+            );
+
             """)
+            for column, definition in (
+                ("nrr_runs_scored", "INTEGER DEFAULT 0"),
+                ("nrr_runs_conceded", "INTEGER DEFAULT 0"),
+                ("nrr_balls_faced", "INTEGER DEFAULT 0"),
+                ("nrr_balls_bowled", "INTEGER DEFAULT 0"),
+                ("nrr_rate_unit_balls", "INTEGER DEFAULT 6"),
+            ):
+                try:
+                    conn.execute(f"ALTER TABLE standings ADD COLUMN {column} {definition}")
+                except sqlite3.OperationalError:
+                    pass
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.path, **self._connection_options)
 
     def clear_tournament(self):
-        with sqlite3.connect(self.path) as conn:
+        with self._connect() as conn:
             conn.execute("DELETE FROM standings")
             conn.execute("DELETE FROM player_stats")
             conn.execute("DELETE FROM matches")
+            conn.execute("DELETE FROM squads")
+            conn.execute("DELETE FROM squad_teams")
+
+    def clear_statistics(self) -> None:
+        """Clear derived standings and player stats while retaining match history."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM standings")
+            conn.execute("DELETE FROM player_stats")
+
+    def delete_last_match(self) -> Optional[Dict[str, object]]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT id, data FROM matches ORDER BY id DESC LIMIT 1").fetchone()
+            if row is None:
+                return None
+            conn.execute("DELETE FROM matches WHERE id = ?", (row[0],))
+        return json.loads(row[1])
+
+    def add_team(self, name: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute("INSERT OR IGNORE INTO squad_teams (name) VALUES (?)", (name.strip(),))
+            return cursor.rowcount == 1
+
+    def add_player(self, team: str, player: str, price: float) -> bool:
+        with self._connect() as conn:
+            team_row = conn.execute(
+                "SELECT name FROM squad_teams WHERE name = ? COLLATE NOCASE", (team.strip(),)
+            ).fetchone()
+            if team_row is None:
+                return False
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO squads (team, player, price) VALUES (?, ?, ?)",
+                (team_row[0], player.strip(), price),
+            )
+            return cursor.rowcount == 1
+
+    def get_team_names(self) -> List[str]:
+        with self._connect() as conn:
+            return [row[0] for row in conn.execute("SELECT name FROM squad_teams ORDER BY name")]
+
+    def get_squads(self) -> List[Dict[str, object]]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT team, player, price FROM squads ORDER BY team, player").fetchall()
+        return [{"team": row[0], "player": row[1], "price": row[2]} for row in rows]
+
+    def get_team_players(self, team: str) -> List[Dict[str, object]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT player, price FROM squads WHERE team = ? COLLATE NOCASE ORDER BY player", (team.strip(),)
+            ).fetchall()
+        return [{"player": row[0], "price": row[1]} for row in rows]
     def save_match(self, match):
 
-        with sqlite3.connect(self.path) as conn:
+        with self._connect() as conn:
 
             conn.execute("""
             INSERT INTO matches
@@ -307,12 +450,9 @@ class TournamentDatabase:
             match["balls2"],
             json.dumps(match)
             ))
-
-
-
     def save_standing(self,name,stats):
 
-        with sqlite3.connect(self.path) as conn:
+        with self._connect() as conn:
 
             conn.execute("""
             INSERT INTO standings
@@ -377,12 +517,20 @@ class TournamentDatabase:
             stats["overs_faced"],
             stats["overs_bowled"],
         ))
+            conn.execute(
+                """UPDATE standings SET nrr_runs_scored=?, nrr_runs_conceded=?, nrr_balls_faced=?,
+                   nrr_balls_bowled=?, nrr_rate_unit_balls=? WHERE team=?""",
+                (
+                    stats["nrr_runs_scored"], stats["nrr_runs_conceded"], stats["nrr_balls_faced"],
+                    stats["nrr_balls_bowled"], stats["nrr_rate_unit_balls"], name,
+                ),
+            )
 
 
 
     def save_player_stat(self,name,stats):
 
-        with sqlite3.connect(self.path) as conn:
+        with self._connect() as conn:
 
             conn.execute("""
             INSERT INTO player_stats
@@ -422,7 +570,7 @@ class TournamentDatabase:
             "matches": []
         }
 
-        with sqlite3.connect(self.path) as conn:
+        with self._connect() as conn:
 
             rows = conn.execute(
                 "SELECT * FROM standings"
@@ -442,6 +590,11 @@ class TournamentDatabase:
                     "balls_bowled": row[10],
                     "overs_faced": row[11],
                     "overs_bowled": row[12],
+                    "nrr_runs_scored": row[13] or row[6],
+                    "nrr_runs_conceded": row[14] or row[7],
+                    "nrr_balls_faced": row[15] or row[9],
+                    "nrr_balls_bowled": row[16] or row[10],
+                    "nrr_rate_unit_balls": row[17] or 6,
                 }
 
             rows = conn.execute(
@@ -463,6 +616,11 @@ class TournamentDatabase:
 
             for row in rows:
                     data["matches"].append(json.loads(row[0]))
+        # Older databases did not store the NRR unit. Infer it from recorded
+        # matches so existing Hundred standings use five-ball sets on restart.
+        if any(_is_hundred_ball_match(match) for match in data["matches"]):
+            for stats in data["teams"].values():
+                stats["nrr_rate_unit_balls"] = 5
         return data
 
 def _get_match_overs(match_data: Dict[str, object]) -> float:
@@ -583,7 +741,10 @@ def _match_format_metadata(payload: Dict[str, object]) -> Dict[str, object]:
     """Keep format fields needed to calculate an all-out innings correctly."""
     return {
         key: payload[key]
-        for key in ("match_type", "overs", "balls_per_innings", "balls_per_over")
+        for key in (
+            "match_type", "overs", "balls_per_innings", "balls_per_over",
+            "nrr_score1", "nrr_balls1", "nrr_score2", "nrr_balls2", "nrr_quota_balls", "exclude_from_nrr", "result_type",
+        )
         if key in payload
     }
 
@@ -832,9 +993,11 @@ def parse_match(text: str) -> Optional[Dict[str, object]]:
 def build_match_prompt() -> str:
     instructions = (
         "Generate a single JSON object for the cricket match simulated above. Use the actual team and player names from the match details. "
-        "Return only valid JSON with no markdown fences, explanations, or extra text. Required fields: match_type, team1, team2, score1, wickets1, balls1, score2, wickets2, balls2, players. "
-        "balls1 and balls2 must be integer legal balls actually faced, never overs notation. For T20/ODI, include overs (for example 20 or 50); these use six balls per over. "
-        "For The Hundred, set match_type to 'The Hundred', balls_per_innings to 100, and balls_per_over to 5. "
+        "Return only valid JSON with no markdown fences, explanations, or extra text. Required fields: match_type, balls_per_over, balls_per_innings, team1, team2, score1, wickets1, balls1, score2, wickets2, balls2, players. "
+        "balls1 and balls2 must be integer legal balls actually faced, never overs notation. The first match locks the tournament NRR format: use six-ball overs for T20/ODI (include overs, such as 20 or 50), or five-ball overs for The Hundred (set match_type to 'The Hundred', balls_per_innings to 100, and balls_per_over to 5). Every later match must use that same format. "
+        "NRR is cumulative: use actual balls for a successful chase; if all out early, provide the actual balls and wickets=10 so the full allotted quota is applied automatically. "
+        "For a DLS-adjusted result, include nrr_score1, nrr_balls1, nrr_score2, nrr_balls2, and nrr_quota_balls with the official NRR-accredited scores, balls, and revised allocation; otherwise omit them. "
+        "For an abandoned/no-result match, set result_type to 'no_result' and exclude_from_nrr to true; it awards one point to each team but adds no NRR totals. Never include Super Over runs or balls. "
         "Each player entry must include runs, balls_faced, wickets, runs_conceded, and balls_bowled."
     )
     return f"{instructions}\n\n{build_match_JsonSample()}"
@@ -843,6 +1006,8 @@ def build_match_JsonSample() -> str:
     example_payload = json.dumps({
             "match_type": "T20I",
             "overs": 20,
+            "balls_per_over": 6,
+            "balls_per_innings": 120,
             "team1": "Team 1",
             "team2": "Team 2",
             "score1": 180,
@@ -863,7 +1028,7 @@ def build_match_JsonSample() -> str:
             },
         }, indent=2)
     return (
-        "Sample JSON:\n"
+        "Sample JSON: normal six-ball T20; omit optional DLS/NRR fields unless applicable.\n"
                 f"```json\n{example_payload}\n```"
     )
         
@@ -887,7 +1052,16 @@ def get_caps_leaders(players: Dict[str, Dict[str, Any]], cap_type: str, top_n: i
     else:
         raise ValueError("cap_type must be 'orange' or 'purple'")
 
-    ordered = sorted(players.items(), key=sort_key)
+    if cap_type == "orange":
+        eligible_players = [
+            item for item in players.items() if int(item[1].get("balls_faced", 0)) > 0
+        ]
+    else:
+        eligible_players = [
+            item for item in players.items() if int(item[1].get("balls_bowled", 0)) > 0
+        ]
+
+    ordered = sorted(eligible_players, key=sort_key)
     results = []
     for player_name, stats in ordered[:top_n]:
         if cap_type == "orange":
@@ -923,6 +1097,23 @@ def format_standings(standings: List[Dict[str, object]]) -> str:
     return "\n".join(lines)
 
 
+def format_squads(squads: List[Dict[str, object]]) -> str:
+    if not squads:
+        return "No squad players recorded yet."
+    return "\n".join(
+        f"{item['team']} | {item['player']} | {float(item['price']):,.2f}" for item in squads
+    )
+
+
+def format_team_squad(team: str, players: List[Dict[str, object]]) -> str:
+    if not players:
+        return f"{team}\n\nNo players recorded yet."
+    return f"{team}\n\n" + "\n".join(
+        f"{item['player']} | {int(item['price']) if float(item['price']).is_integer() else item['price']}"
+        for item in players
+    )
+
+
 def format_caps(players: Dict[str, Dict[str, Any]], top_n: int = 10) -> str:
     if not players:
         return "No player stats recorded yet."
@@ -956,10 +1147,13 @@ def format_cap_page(
         return "No player stats recorded yet.", 1
 
     leaders = get_caps_leaders(players, cap_type, top_n=len(players))
+    title = "Orange Cap" if cap_type == "orange" else "Purple Cap"
+    if not leaders:
+        activity = "faced a ball" if cap_type == "orange" else "bowled a ball"
+        return f"No eligible players yet. No player has {activity}.", 1
     total_pages = max(1, (len(leaders) + page_size - 1) // page_size)
     page = max(0, min(page, total_pages - 1))
     page_leaders = leaders[page * page_size : (page + 1) * page_size]
-    title = "Orange Cap" if cap_type == "orange" else "Purple Cap"
     lines = [f"{title} (Page {page + 1}/{total_pages})", ""]
 
     for rank, item in enumerate(page_leaders, start=page * page_size + 1):
@@ -982,8 +1176,39 @@ saved = database.load_all()
 state.teams = saved["teams"]
 state.players = saved["players"]
 state.matches = saved["matches"]
+if state.matches:
+    first_match = state.matches[0]
+    state.nrr_balls_per_over = _get_balls_per_over(first_match)
+    state.nrr_quota_balls = _get_match_quota_balls(first_match)
+    for team_stats in state.teams.values():
+        team_stats["nrr_rate_unit_balls"] = state.nrr_balls_per_over
+state._refresh_rates()
 # Stores admins who clicked "Add Match" and are allowed to send one JSON
 waiting_for_match: Dict[int, bool] = {}
+
+
+def remove_last_match() -> bool:
+    """Delete the latest stored match and rebuild all derived tournament data."""
+    if database.delete_last_match() is None:
+        return False
+
+    remaining_matches = database.load_all()["matches"]
+    admin_ids = set(state.admin_ids)
+    state.teams.clear()
+    state.players.clear()
+    state.matches.clear()
+    state.nrr_balls_per_over = None
+    state.nrr_quota_balls = None
+    for match in remaining_matches:
+        state.apply_match(match)
+    state.admin_ids = admin_ids
+
+    database.clear_statistics()
+    for team, stats in state.teams.items():
+        database.save_standing(team, stats)
+    for player, stats in state.players.items():
+        database.save_player_stat(player, stats)
+    return True
 
 # Optional:
 # Put your match topic ID here if using Telegram forum topics.
@@ -996,6 +1221,66 @@ for admin_id in parse_admin_ids(ADMIN_USER_IDS):
 
 def _is_match_payload(text: str) -> bool:
     return parse_match(text) is not None
+
+
+def validate_match_json(text: str) -> Optional[str]:
+    """Validate the full JSON schema required for standings, NRR, and cap stats."""
+    candidates = _extract_json_candidates(text)
+    if not candidates:
+        return "Please send the complete JSON generated from Prompt."
+
+    try:
+        payload = json.loads(candidates[0])
+    except json.JSONDecodeError:
+        return "The JSON is invalid."
+    if not isinstance(payload, dict):
+        return "The match payload must be one JSON object."
+
+    required_fields = {
+        "match_type", "balls_per_over", "balls_per_innings", "team1", "team2",
+        "score1", "wickets1", "balls1", "score2", "wickets2", "balls2", "players",
+    }
+    missing = sorted(field for field in required_fields if field not in payload)
+    if missing:
+        return "Missing required field(s): " + ", ".join(missing) + "."
+
+    try:
+        if int(payload["balls_per_over"]) <= 0 or int(payload["balls_per_innings"]) <= 0:
+            return "balls_per_over and balls_per_innings must be positive integers."
+        for field in ("score1", "wickets1", "balls1", "score2", "wickets2", "balls2"):
+            if int(payload[field]) < 0:
+                return f"{field} cannot be negative."
+    except (TypeError, ValueError):
+        return "Scores, wickets, balls, and format values must be integers."
+
+    players = payload["players"]
+    if not isinstance(players, dict) or not players:
+        return "players must contain both teams' player statistics."
+    required_player_fields = {"runs", "balls_faced", "wickets", "runs_conceded", "balls_bowled"}
+    for team_name in (str(payload["team1"]), str(payload["team2"])):
+        team_players = players.get(team_name)
+        if not isinstance(team_players, dict) or not team_players:
+            return f"players must include player statistics for {team_name}."
+        for player_name, stats in team_players.items():
+            if not isinstance(stats, dict):
+                return f"Player {player_name} must have a statistics object."
+            missing_stats = sorted(field for field in required_player_fields if field not in stats)
+            if missing_stats:
+                return f"Player {player_name} is missing: " + ", ".join(missing_stats) + "."
+    return None
+
+
+def validate_match_for_tournament(match_data: Dict[str, object]) -> Optional[str]:
+    """Ensure every match uses the NRR format set by the first tournament match."""
+    if state.nrr_balls_per_over is None:
+        return None
+    balls_per_over = _get_balls_per_over(match_data)
+    if balls_per_over != state.nrr_balls_per_over:
+        return (
+            f"This tournament is locked to {state.nrr_balls_per_over}-ball overs from its first match. "
+            f"This JSON uses {balls_per_over}-ball overs, so it was not added."
+        )
+    return None
 
 
 def build_help() -> str:
@@ -1025,7 +1310,7 @@ def build_main_keyboard(user_id: Optional[int] = None) -> Any:
         return None
     rows = [
         [
-            InlineKeyboardButton("Standings", callback_data="standings"),
+            InlineKeyboardButton("Table", callback_data="standings"),
             InlineKeyboardButton("Caps", callback_data="caps"),
             InlineKeyboardButton("Help", callback_data="help"),
         ],
@@ -1035,6 +1320,7 @@ def build_main_keyboard(user_id: Optional[int] = None) -> Any:
         ],
     ]
     if user_id is not None and state.is_admin(user_id):
+        rows.append([InlineKeyboardButton("Remove last match", callback_data="remove_last_match")])
         rows.append([InlineKeyboardButton("End tournament", callback_data="end_tournament")])
     return InlineKeyboardMarkup(rows)
 
@@ -1069,6 +1355,15 @@ def build_clear_confirmation_keyboard() -> Any:
     ]])
 
 
+def build_remove_last_match_keyboard() -> Any:
+    if InlineKeyboardButton is None or InlineKeyboardMarkup is None:
+        return None
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Yes, remove last match", callback_data="confirm_remove_last_match"),
+        InlineKeyboardButton("Cancel", callback_data="cancel_remove_last_match"),
+    ]])
+
+
 def handle_message(text: str, user_id: Optional[int] = None) -> str:
     text = text.strip()
     if not text:
@@ -1097,6 +1392,12 @@ def handle_message(text: str, user_id: Optional[int] = None) -> str:
 
     match_data = parse_match(text)
     if match_data:
+        validation_error = validate_match_json(text)
+        if validation_error:
+            return f"⚠️ {validation_error} Use /prompt, paste it into AI, then send the complete JSON."
+        format_error = validate_match_for_tournament(match_data)
+        if format_error:
+            return format_error
         state.apply_match(match_data)
         database.save_match(match_data)
 
@@ -1238,6 +1539,32 @@ async def handle_callback_query(update: Any, context: Any) -> None:
             "Only your next message will be processed as a match.\n"
             "All other group messages are ignored."
         )
+    elif data == "remove_last_match":
+        if user_id is None or not state.is_admin(user_id):
+            await query.message.reply_text("Only an admin can remove a match.")
+            return
+        if not state.matches:
+            await query.message.reply_text("There is no recorded match to remove.")
+            return
+        last_match = state.matches[-1]
+        await query.message.reply_text(
+            f"Remove the latest match: {last_match['team1']} vs {last_match['team2']}? "
+            "This will recalculate the table and cap leaderboards.",
+            reply_markup=build_remove_last_match_keyboard(),
+        )
+    elif data == "confirm_remove_last_match":
+        if user_id is None or not state.is_admin(user_id):
+            await query.message.reply_text("Only an admin can remove a match.")
+            return
+        if remove_last_match():
+            await query.message.reply_text(
+                "Latest match removed.\n\n" + format_standings(state.get_standings()),
+                reply_markup=build_main_keyboard(user_id),
+            )
+        else:
+            await query.message.reply_text("There is no recorded match to remove.")
+    elif data == "cancel_remove_last_match":
+        await query.message.reply_text("The latest match was not removed.", reply_markup=build_main_keyboard(user_id))
     elif data == "end_tournament":
         if user_id is None or not state.is_admin(user_id):
             await query.message.reply_text("Only an admin can end and clear a tournament.")
@@ -1304,6 +1631,16 @@ async def handle_text_message(update, context) -> None:
     match_data = parse_match(text)
 
     if match_data:
+        validation_error = validate_match_json(text)
+        if validation_error:
+            await update.message.reply_text(
+                f"❌ {validation_error}\n\nUse the Prompt button, paste it into AI, then send the complete JSON."
+            )
+            return
+        format_error = validate_match_for_tournament(match_data)
+        if format_error:
+            await update.message.reply_text(f"❌ {format_error}")
+            return
         state.apply_match(match_data)
         database.save_match(match_data)
         for team, stats in state.teams.items():
