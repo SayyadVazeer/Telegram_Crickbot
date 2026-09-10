@@ -7,6 +7,11 @@ import hashlib
 from typing import Any, Dict, List, Optional
 
 try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    Image = ImageDraw = ImageFont = None
+
+try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - optional dependency
     def load_dotenv() -> bool:
@@ -35,11 +40,13 @@ DATABASE_PATH = os.getenv(
     "/app/data/tournament.db"
 ).strip()
 
-async def cancel_match_wait(user_id: int):
+async def cancel_match_wait(user_id: int, session_token: int):
     await asyncio.sleep(300)
 
-    if waiting_for_match.get(user_id):
+    # Only cancel if the session hasn't been replaced by a new "Add Match" click
+    if _match_session_tokens.get(user_id) == session_token:
         waiting_for_match.pop(user_id, None)
+        _match_session_tokens.pop(user_id, None)
 
 def parse_admin_ids(value: str) -> set[int]:
     if not value:
@@ -91,8 +98,6 @@ class TournamentState:
                 "points": 0,
                 "runs_scored": 0,
                 "runs_conceded": 0,
-                "wickets_taken": 0,
-                "wickets_lost": 0,
                 "balls_faced": 0,
                 "balls_bowled": 0,
                 "overs_faced": 0.0,
@@ -155,8 +160,6 @@ class TournamentState:
 
         self.teams[team1]["runs_scored"] += score1
         self.teams[team1]["runs_conceded"] += score2
-        self.teams[team1]["wickets_taken"] += wickets2
-        self.teams[team1]["wickets_lost"] += wickets1
         self.teams[team1]["balls_faced"] += balls1
         self.teams[team1]["balls_bowled"] += balls2
         if counts_for_nrr:
@@ -167,8 +170,6 @@ class TournamentState:
 
         self.teams[team2]["runs_scored"] += score2
         self.teams[team2]["runs_conceded"] += score1
-        self.teams[team2]["wickets_taken"] += wickets1
-        self.teams[team2]["wickets_lost"] += wickets2
         self.teams[team2]["balls_faced"] += balls2
         self.teams[team2]["balls_bowled"] += balls1
         if counts_for_nrr:
@@ -204,7 +205,10 @@ class TournamentState:
                 for player_name, stats in players.items():
                     if not isinstance(stats, dict):
                         continue
-                    safe_name = str(player_name)
+                    raw_name = str(player_name)
+                    # Try to find a canonical name via fuzzy matching
+                    canonical = _find_canonical_player(raw_name, self.players)
+                    safe_name = canonical if canonical else raw_name
                     self.add_player(safe_name)
                     self.players[safe_name]["runs"] += int(stats.get("runs", 0))
                     self.players[safe_name]["wickets"] += int(stats.get("wickets", 0))
@@ -353,6 +357,16 @@ class TournamentDatabase:
                 FOREIGN KEY (team) REFERENCES squad_teams(name)
             );
 
+            CREATE TABLE IF NOT EXISTS team_shortcodes (
+                team_name TEXT PRIMARY KEY,
+                short_code TEXT NOT NULL UNIQUE
+            );
+
+            CREATE TABLE IF NOT EXISTS config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
             """)
             for column, definition in (
                 ("nrr_runs_scored", "INTEGER DEFAULT 0"),
@@ -376,6 +390,7 @@ class TournamentDatabase:
             conn.execute("DELETE FROM matches")
             conn.execute("DELETE FROM squads")
             conn.execute("DELETE FROM squad_teams")
+            conn.execute("DELETE FROM team_shortcodes")
 
     def clear_statistics(self) -> None:
         """Clear derived standings and player stats while retaining match history."""
@@ -424,6 +439,34 @@ class TournamentDatabase:
                 "SELECT player, price FROM squads WHERE team = ? COLLATE NOCASE ORDER BY player", (team.strip(),)
             ).fetchall()
         return [{"player": row[0], "price": row[1]} for row in rows]
+
+    def save_team_shortcodes(self, mappings: Dict[str, str]) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM team_shortcodes")
+            for team_name, short_code in mappings.items():
+                conn.execute(
+                    "INSERT OR REPLACE INTO team_shortcodes (team_name, short_code) VALUES (?, ?)",
+                    (team_name, short_code),
+                )
+
+    def load_team_shortcodes(self) -> Dict[str, str]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT team_name, short_code FROM team_shortcodes").fetchall()
+        return {row[0]: row[1] for row in rows}
+
+    def get_config(self, key: str) -> Optional[str]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT value FROM config WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_config(self, key: str, value: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO config (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = ?",
+                (key, value, value),
+            )
+
     def save_match(self, match):
 
         with self._connect() as conn:
@@ -590,6 +633,8 @@ class TournamentDatabase:
                     "balls_bowled": row[10],
                     "overs_faced": row[11],
                     "overs_bowled": row[12],
+                    "run_rate": 0.0,
+                    "strike_rate": 0.0,
                     "nrr_runs_scored": row[13] or row[6],
                     "nrr_runs_conceded": row[14] or row[7],
                     "nrr_balls_faced": row[15] or row[9],
@@ -743,6 +788,7 @@ def _match_format_metadata(payload: Dict[str, object]) -> Dict[str, object]:
         key: payload[key]
         for key in (
             "match_type", "overs", "balls_per_innings", "balls_per_over",
+            "team1_short", "team2_short",
             "nrr_score1", "nrr_balls1", "nrr_score2", "nrr_balls2", "nrr_quota_balls", "exclude_from_nrr", "result_type",
         )
         if key in payload
@@ -824,6 +870,7 @@ def _parse_scorecard_text(text: str) -> Optional[Dict[str, object]]:
         wickets = int(total_match.group("wkts"))
         balls = _overs_notation_to_balls(total_match.group("overs"),5 if "HUNDRED" in text.upper() else 6)
         players_payload: Dict[str, Dict[str, int]] = {}
+        bpo = 5 if "HUNDRED" in text.upper() else 6
         for line in innings["section"].splitlines():
             bowler_match = re.match(
                 r"^(?P<player>[A-Za-z.\- ]+?)\s{2,}(?P<overs>\d+(?:\.\d+)?)\s+(?P<runs>\d+)\s+(?P<wickets>\d+)(?:\s+(?P<econ>\d+(?:\.\d+)?))?$",
@@ -831,13 +878,38 @@ def _parse_scorecard_text(text: str) -> Optional[Dict[str, object]]:
             )
             if bowler_match:
                 player_name = bowler_match.group("player").strip()
-                players_payload[player_name] = {
-                    "runs": 0,
-                    "wickets": int(bowler_match.group("wickets")),
-                    "balls_faced": 0,
-                    "runs_conceded": 0,
-                    "balls_bowled": 0,
-                }
+                bowler_balls = _overs_notation_to_balls(bowler_match.group("overs"), bpo)
+                if player_name in players_payload:
+                    players_payload[player_name]["wickets"] = int(bowler_match.group("wickets"))
+                    players_payload[player_name]["runs_conceded"] = int(bowler_match.group("runs"))
+                    players_payload[player_name]["balls_bowled"] = bowler_balls
+                else:
+                    players_payload[player_name] = {
+                        "runs": 0,
+                        "wickets": int(bowler_match.group("wickets")),
+                        "balls_faced": 0,
+                        "runs_conceded": int(bowler_match.group("runs")),
+                        "balls_bowled": bowler_balls,
+                    }
+                continue
+            # Batter line: name, dismissal, runs, balls, optional SR
+            batter_match = re.match(
+                r"^(?P<player>.+?)\s{2,}\S.*\s+(?P<runs>\d+)\s+(?P<balls>\d+)(?:\s+(?P<sr>\d+(?:\.\d+)?))?\s*$",
+                line.strip(),
+            )
+            if batter_match:
+                player_name = batter_match.group("player").strip()
+                if player_name in players_payload:
+                    players_payload[player_name]["runs"] = int(batter_match.group("runs"))
+                    players_payload[player_name]["balls_faced"] = int(batter_match.group("balls"))
+                else:
+                    players_payload[player_name] = {
+                        "runs": int(batter_match.group("runs")),
+                        "wickets": 0,
+                        "balls_faced": int(batter_match.group("balls")),
+                        "runs_conceded": 0,
+                        "balls_bowled": 0,
+                    }
         parsed_innings.append({
             "team": innings["team"],
             "score": score,
@@ -940,8 +1012,13 @@ def parse_match(text: str) -> Optional[Dict[str, object]]:
                             "players": players_payload,
                         }
 
-                team1 = str(payload.get("team1", "")).strip()
-                team2 = str(payload.get("team2", "")).strip()
+                team1_raw = str(payload.get("team1", "")).strip()
+                team2_raw = str(payload.get("team2", "")).strip()
+                # Resolve short codes to full team names
+                t1_short = str(payload.get("team1_short", "")).strip()
+                t2_short = str(payload.get("team2_short", "")).strip()
+                team1 = _resolve_team_name(t1_short) if t1_short else team1_raw
+                team2 = _resolve_team_name(t2_short) if t2_short else team2_raw
                 score1 = int(payload.get("score1", 0))
                 score2 = int(payload.get("score2", 0))
                 wickets1 = int(payload.get("wickets1", 0))
@@ -971,12 +1048,14 @@ def parse_match(text: str) -> Optional[Dict[str, object]]:
     )
     if compact_match:
         players_payload = _extract_players_from_text(stripped)
+        t1_raw = compact_match.group("team1").strip()
+        t2_raw = compact_match.group("team2").strip()
         return {
-            "team1": compact_match.group("team1").strip(),
+            "team1": _resolve_team_name(t1_raw),
             "score1": int(compact_match.group("score1")),
             "wickets1": int(compact_match.group("wickets1") or 0),
             "balls1": int(compact_match.group("balls1")),
-            "team2": compact_match.group("team2").strip(),
+            "team2": _resolve_team_name(t2_raw),
             "score2": int(compact_match.group("score2")),
             "wickets2": int(compact_match.group("wickets2") or 0),
             "balls2": int(compact_match.group("balls2")),
@@ -991,14 +1070,22 @@ def parse_match(text: str) -> Optional[Dict[str, object]]:
 
 
 def build_match_prompt() -> str:
+    if team_mappings:
+        mappings_str = ", ".join(f"{code}={name}" for name, code in sorted(team_mappings.items()))
+    else:
+        mappings_str = "(no team short codes registered yet — use /setshort CODE TeamName to register)"
+
     instructions = (
         "Generate a single JSON object for the cricket match simulated above. Use the actual team and player names from the match details. "
-        "Return only valid JSON with no markdown fences, explanations, or extra text. Required fields: match_type, balls_per_over, balls_per_innings, team1, team2, score1, wickets1, balls1, score2, wickets2, balls2, players. "
+        "Return only valid JSON with no markdown fences, explanations, or extra text. Required fields: match_type, balls_per_over, balls_per_innings, team1, team2, score1, wickets1, balls1, score2, wickets2, balls2, players, team1_short, team2_short. "
+        f"Available team short codes: {mappings_str}. "
+        "For each team, set team1_short and team2_short to the registered short code for that team name. "
         "balls1 and balls2 must be integer legal balls actually faced, never overs notation. The first match locks the tournament NRR format: use six-ball overs for T20/ODI (include overs, such as 20 or 50), or five-ball overs for The Hundred (set match_type to 'The Hundred', balls_per_innings to 100, and balls_per_over to 5). Every later match must use that same format. "
         "NRR is cumulative: use actual balls for a successful chase; if all out early, provide the actual balls and wickets=10 so the full allotted quota is applied automatically. "
         "For a DLS-adjusted result, include nrr_score1, nrr_balls1, nrr_score2, nrr_balls2, and nrr_quota_balls with the official NRR-accredited scores, balls, and revised allocation; otherwise omit them. "
         "For an abandoned/no-result match, set result_type to 'no_result' and exclude_from_nrr to true; it awards one point to each team but adds no NRR totals. Never include Super Over runs or balls. "
-        "Each player entry must include runs, balls_faced, wickets, runs_conceded, and balls_bowled."
+        "Each player entry must include runs, balls_faced, wickets, runs_conceded, and balls_bowled. "
+        "Use the FULL player name consistently across all entries (e.g., always 'Virat Kohli', never 'Kohli' or 'V. Kohli')."
     )
     return f"{instructions}\n\n{build_match_JsonSample()}"
 
@@ -1031,7 +1118,234 @@ def build_match_JsonSample() -> str:
         "Sample JSON: normal six-ball T20; omit optional DLS/NRR fields unless applicable.\n"
                 f"```json\n{example_payload}\n```"
     )
-        
+
+
+def build_simulation_prompt() -> str:
+    """Build the match simulation prompt with team short codes injected."""
+    if team_mappings:
+        mappings_str = ", ".join(f"{code}={name}" for name, code in sorted(team_mappings.items()))
+    else:
+        mappings_str = "(no team short codes registered yet — use /setshort CODE TeamName to register)"
+
+    team_section = (
+        f"------------------------------------------------------\n"
+        f"BEFORE SIMULATING, VERIFY:\n"
+        f"1. Both teams MUST be from the registered teams list below.\n"
+        f"2. The user MUST provide playing 11 for both teams.\n"
+        f"3. The user MUST provide the venue.\n"
+        f"If any of the above is missing or teams are not registered, STOP and ask.\n"
+        f"------------------------------------------------------\n"
+        f"REGISTERED TEAMS:\n"
+        f"{mappings_str}\n"
+        f"------------------------------------------------------\n"
+    )
+
+    return f"{team_section}\n{SIMULATION_PROMPT_TEXT}"
+
+
+SIMULATION_PROMPT_TEXT = (
+    "Simulate a realistic Mens Hundred league match (two teams) with full ball-by-ball professional TV-broadcast commentary from \n"
+    "1st over - 0.1 to 0.5\n"
+    "2nd over - 1.1 to 1.5\n"
+    "....20 th over - 19.1 to 19.5\n"
+    "\n"
+    "COMMENTARY STYLE:\n"
+    "Write all commentary in the style of the official Hundred broadcast team — Simon Doull and Ian Smith. Keep it punchy, dramatic, and TV-ready. For 4s and 6s, go vivid with shot description and crowd reaction. For wickets, build the drama. Keep 1/2/3 run lines short and crisp.\n"
+    "\n"
+    "Follow true Hundred league gameplay, proper cricket logics: ups & downs, pressure, partnerships, momentum shifts. Make it independent of whether batting or bowling first, best team should win.Go according to all rules of Mens Hundred league matches. Use given batting orders & bowling sequences only (no changes).\n"
+    "------------------------------------------------------\n"
+    "Study the below cricket ground venue and it's conditions and use it for the simulation of the match!\n"
+    "\n"
+    "\U0001f3df Venue & Conditions\n"
+    "\n"
+    "Venue:\n"
+    "\n"
+    "DO THE TOSS YOURSELF AND SELECT BAT/BOWL ACCORDING TO GROUND CONDITIONS. \n"
+    "------------------------------------------------------\n"
+    "Match rules:\n"
+    "\n"
+    "1) 20 overs per side\n"
+    "Powerplay: 5 overs (2 fielders outside 30-yard circle)\n"
+    "Max overs per bowler: 4\n"
+    "2) Simulate all 20 overs in each innings with ball by ball commentary. Don't skip overs.\n"
+    "3) Finish the innings if the target is reached or all the 10 wickets fall. \n"
+    "4) Batters must attack part-time bowlers but part-timer can't unrealistically take 3-4 wickets.\n"
+    "5)Pure tailenders should struggle vs quality bowling, rotate strike, no consistent sixes.\n"
+    "6) Set batters fall only to logical deliveries and match situations.\n"
+    "7) Set batters should safeguard tailenders by farming the strike, protecting their wicket, and managing strike rotation smartly.\n"
+    "8)During death overs,set batsman must face more balls and play aggressively to maximize runs.\n"
+    "9) Include extras (wides, no-balls, byes, leg-byes) + fielding events (catches, drops, misfields, overthrows, edges) + DRS. \n"
+    "---------------------------------------\n"
+    "STRIKE ROTATION RULES :(OBEY MUST) \n"
+    "\n"
+    "\U0001f4a5Each set = 2 overs\n"
+    "1st set = 1,2 overs\n"
+    "2nd set = 3,4 overs\n"
+    "... \n"
+    "9th set = 17,18 overs\n"
+    "10th set = 19,20 overs\n"
+    "\n"
+    "\U0001f4a5How the bowling end changes :\n"
+    "1) At the start of 1st innings,bowler will start in one bowling end say end A.After every set finish(2 overs) , the bowler has to change bowling end say end B.\n"
+    "Thus A and B changes alternatively. \n"
+    "2) In the 2nd innings, bowler again starts with end A and change alternatively after each set(2 overs).\n"
+    "\n"
+    "\U0001f4a5How the batter strike changes:\n"
+    "1) From odd(1,3,...17,19) over to even (2,4,...18,20) over change :\n"
+    "On the last ball if batter :\n"
+    "a) hit 1,3,5,.... runs; then that batter is non-striker for next over first ball. \n"
+    "b) hit 0,2,4,6,..runs; then that batter is striker for next over first ball.\n"
+    "c) gets out ; then new batsman will be striker for next over first ball.\n"
+    "\n"
+    "2) From even (2,4,....18) to odd(3,5,....17,19) over change :\n"
+    "On the last ball if batter :\n"
+    "a) hit 1,3,5,.... runs; then that batter is striker for next over first ball.\n"
+    "b) hit 0,2,4,6,..runs; then that batter is non-striker next over first ball.\n"
+    "c) gets out ; then new batsman will be non-striker next over first ball.\n"
+    "\n"
+    "After every over, clearly state which batter will be on strike at the start of the next over.(must say)\n"
+    "------------------------------------------------------\n"
+    "\u26a1 After every 2 overs, give this EXACT sample update, never miss it after 2 overs(no mistakes and don't forget):\n"
+    "\n"
+    "BATTING TEAM NAME:\n"
+    "\U0001f535LIVE Score: 140/5 (18 over)\n"
+    "\U0001f525 Last 2 overs - 15/1\n"
+    "- Need: 20 off 10 balls (2nd innings only)\n"
+    "- CRR: 7.77 \n"
+    "- RRR: 10.00 (2nd innings only)\n"
+    "\n"
+    "\u2696 Opponent was - runs/wickets after 18 overs (2nd innings only)\n"
+    "\U0001f3cf Current Batters\n"
+    "- M. Patel: 18* (12) | SR: 150.00 | 4s: 2 | 6s: 1\n"
+    "- A. Rawat: 6* (4) | SR: 150.00 | 4s: 1 | 6s: 0\n"
+    "Partnership = Runs(balls)\n"
+    "\n"
+    "\U0001f4a5 Last 2 bowlers Stats\n"
+    "- Bumrah: 4-0-26-2\n"
+    "- Rashid: 4-0-24-1\n"
+    "x Last wicket -(batter stats)\n"
+    "\n"
+    "Double check every over runs and the scorecard runs too.\n"
+    "------------------------------------------------------\n"
+    "End of match :\n"
+    "1)Declare result+POTM (with reason)+Both captains speech about match result.\n"
+    "2)Give full batting & bowling scorecards of both innings(Compulsory never miss it).\n"
+    "3) Highlight key moments/partnerships/turning points.\n"
+)
+
+
+UPCOMING_SIMULATION_PROMPT_TEXT = (
+    "Simulate a realistic Mens Hundred league match (two teams) with full ball-by-ball professional TV-broadcast commentary from \n"
+    "Set 1 - balls 1.1 to 1.5\n"
+    "Set 2 - balls 2.1 to 2.5\n"
+    "....20th set - balls 20.1 to 20.5\n"
+    "\n"
+    "COMMENTARY STYLE:\n"
+    "Write all commentary in the style of the official Hundred broadcast team — Simon Doull and Ian Smith. Keep it punchy, dramatic, and TV-ready. For 4s and 6s, go vivid with shot description and crowd reaction. For wickets, build the drama. Keep 1/2/3 run lines short and crisp.\n"
+    "\n"
+    "Follow true Hundred league gameplay, proper cricket logics: ups & downs, pressure, partnerships, momentum shifts. Make it independent of whether batting or bowling first, best team should win. Go according to all rules of Mens Hundred league matches. Use given batting orders & bowling sequences only (no changes).\n"
+    "------------------------------------------------------\n"
+    "Study the below cricket ground venue and it's conditions and use it for the simulation of the match!\n"
+    "\n"
+    "\U0001f3df Venue & Conditions\n"
+    "\n"
+    "Venue:\n"
+    "\n"
+    "DO THE TOSS YOURSELF AND SELECT BAT/BOWL ACCORDING TO GROUND CONDITIONS. \n"
+    "------------------------------------------------------\n"
+    "Match rules (The Hundred format):\n"
+    "\n"
+    "1) 100 balls per side (20 sets of 5 balls each)\n"
+    "   Powerplay: first 25 balls — only 2 fielders allowed outside the ring\n"
+    "   Max 20 balls per bowler (4 sets)\n"
+    "2) Simulate all 100 balls (20 sets) in each innings with ball by ball commentary. Don't skip sets.\n"
+    "3) Finish the innings if the target is reached or all 10 wickets fall. \n"
+    "4) Batters must attack part-time bowlers but part-timer can't unrealistically take 3-4 wickets.\n"
+    "5) Pure tailenders should struggle vs quality bowling, rotate strike, no consistent sixes.\n"
+    "6) Set batters fall only to logical deliveries and match situations.\n"
+    "7) Set batters should safeguard tailenders by farming the strike, protecting their wicket, and managing strike rotation smartly.\n"
+    "8) During death overs, set batsman must face more balls and play aggressively to maximize runs.\n"
+    "9) Include extras (wides, no-balls, byes, leg-byes) + fielding events (catches, drops, misfields, overthrows, edges) + DRS. \n"
+    "---------------------------------------\n"
+    "STRIKE ROTATION RULES :(OBEY MUST) \n"
+    "\n"
+    "\U0001f4a5Each set = 10 balls (5 balls per over x 2 overs)\n"
+    "1st set = balls 1-10\n"
+    "2nd set = balls 11-20\n"
+    "... \n"
+    "10th set = balls 91-100\n"
+    "\n"
+    "\U0001f4a5How the bowling end changes :\n"
+    "1) At the start of 1st innings, bowler will start in one bowling end say end A. After every set finish (10 balls), the bowler has to change bowling end say end B.\n"
+    "Thus A and B changes alternatively. \n"
+    "2) In the 2nd innings, bowler again starts with end A and changes alternatively after each set (10 balls).\n"
+    "\n"
+    "\U0001f4a5How the batter strike changes:\n"
+    "1) From odd set (1,3,...17,19) to even set (2,4,...18,20) :\n"
+    "On the last ball if batter :\n"
+    "a) hit 1,3,5,.... runs; then that batter is non-striker for next set first ball. \n"
+    "b) hit 0,2,4,6,..runs; then that batter is striker for next set first ball.\n"
+    "c) gets out ; then new batsman will be striker for next set first ball.\n"
+    "\n"
+    "2) From even set (2,4,...18,20) to odd set (3,5,...19) :\n"
+    "On the last ball if batter :\n"
+    "a) hit 1,3,5,.... runs; then that batter is striker for next set first ball.\n"
+    "b) hit 0,2,4,6,..runs; then that batter is non-striker for next set first ball.\n"
+    "c) gets out ; then new batsman will be non-striker for next set first ball.\n"
+    "\n"
+    "After every set, clearly state which batter will be on strike at the start of the next set. (must say)\n"
+    "------------------------------------------------------\n"
+    "\u26a1 After every set (10 balls), give this EXACT sample update, never miss it after a set (no mistakes and don't forget):\n"
+    "\n"
+    "BATTING TEAM NAME:\n"
+    "\U0001f535LIVE Score: 140/5 (18 sets)\n"
+    "\U0001f525 Last set - 15/1\n"
+    "- Need: 20 off 10 balls (2nd innings only)\n"
+    "- CRR: 7.77 \n"
+    "- RRR: 10.00 (2nd innings only)\n"
+    "\n"
+    "\u2696 Opponent was - runs/wickets after 18 sets (2nd innings only)\n"
+    "\U0001f3cf Current Batters\n"
+    "- M. Patel: 18* (12) | SR: 150.00 | 4s: 2 | 6s: 1\n"
+    "- A. Rawat: 6* (4) | SR: 150.00 | 4s: 1 | 6s: 0\n"
+    "Partnership = Runs(balls)\n"
+    "\n"
+    "\U0001f4a5 Last 2 sets bowlers Stats\n"
+    "- Bumrah: 20 balls - 0 maidens - 26 runs - 2 wickets\n"
+    "- Rashid: 20 balls - 0 maidens - 24 runs - 1 wicket\n"
+    "x Last wicket -(batter stats)\n"
+    "\n"
+    "Double check every set's runs and the scorecard runs too.\n"
+    "------------------------------------------------------\n"
+    "End of match :\n"
+    "1) Declare result+POTM (with reason)+Both captains speech about match result.\n"
+    "2) Give full batting & bowling scorecards of both innings (Compulsory never miss it).\n"
+    "3) Highlight key moments/partnerships/turning points.\n"
+)
+
+
+def build_upcoming_simulation_prompt() -> str:
+    """Build the upcoming simulation prompt with corrected Hundred rules."""
+    if team_mappings:
+        mappings_str = ", ".join(f"{code}={name}" for name, code in sorted(team_mappings.items()))
+    else:
+        mappings_str = "(no team short codes registered yet — use /setshort CODE TeamName to register)"
+
+    team_section = (
+        f"------------------------------------------------------\n"
+        f"BEFORE SIMULATING, VERIFY:\n"
+        f"1. Both teams MUST be from the registered teams list below.\n"
+        f"2. The user MUST provide playing 11 for both teams.\n"
+        f"3. The user MUST provide the venue.\n"
+        f"If any of the above is missing or teams are not registered, STOP and ask.\n"
+        f"------------------------------------------------------\n"
+        f"REGISTERED TEAMS:\n"
+        f"{mappings_str}\n"
+        f"------------------------------------------------------\n"
+    )
+
+    return f"{team_section}\n{UPCOMING_SIMULATION_PROMPT_TEXT}"
+
 
 def get_caps_leaders(players: Dict[str, Dict[str, Any]], cap_type: str, top_n: int = 10) -> List[Dict[str, Any]]:
     if cap_type == "orange":
@@ -1091,7 +1405,7 @@ def format_standings(standings: List[Dict[str, object]]) -> str:
     lines = ["Tournament Standings", ""]
     for idx, item in enumerate(standings, start=1):
         lines.append(
-            f"{idx}. {item['team']}\n"
+            f"{idx}. {_resolve_team_label(str(item['team']))}\n"
             f"   P {item['played']} | W {item['wins']} | D {item['draws']} | L {item['losses']} | Pt {item['points']} | NRR {item['net_run_rate']}"
         )
     return "\n".join(lines)
@@ -1124,12 +1438,12 @@ def format_caps(players: Dict[str, Dict[str, Any]], top_n: int = 10) -> str:
     orange_lines = []
     for idx, item in enumerate(orange, start=1):
         prefix = "🟠 " if idx == 1 else ""
-        orange_lines.append(f"{idx}. {prefix}{item['name']}: {item['runs']} runs, SR {item['strike_rate']}")
+        orange_lines.append(f"{idx}. {prefix}{_format_cap_player_name(item['name'])}: {item['runs']} runs, SR {item['strike_rate']}")
 
     purple_lines = []
     for idx, item in enumerate(purple, start=1):
         prefix = "🟣 " if idx == 1 else ""
-        purple_lines.append(f"{idx}. {prefix}{item['name']}: {item['wickets']} wickets, Econ {item['economy']}")
+        purple_lines.append(f"{idx}. {prefix}{_format_cap_player_name(item['name'])}: {item['wickets']} wickets, Econ {item['economy']}")
 
     return "Orange Cap\n" + "\n".join(orange_lines) + "\n\nPurple Cap\n" + "\n".join(purple_lines)
 
@@ -1159,10 +1473,10 @@ def format_cap_page(
     for rank, item in enumerate(page_leaders, start=page * page_size + 1):
         if cap_type == "orange":
             prefix = "🟠 " if rank == 1 else ""
-            lines.append(f"{rank}. {prefix}{item['name']}: {item['runs']} runs, SR {item['strike_rate']}")
+            lines.append(f"{rank}. {prefix}{_format_cap_player_name(item['name'])}: {item['runs']} runs, SR {item['strike_rate']}")
         else:
             prefix = "🟣 " if rank == 1 else ""
-            lines.append(f"{rank}. {prefix}{item['name']}: {item['wickets']} wickets, Econ {item['economy']}")
+            lines.append(f"{rank}. {prefix}{_format_cap_player_name(item['name'])}: {item['wickets']} wickets, Econ {item['economy']}")
 
     return "\n".join(lines), total_pages
 
@@ -1185,6 +1499,206 @@ if state.matches:
 state._refresh_rates()
 # Stores admins who clicked "Add Match" and are allowed to send one JSON
 waiting_for_match: Dict[int, bool] = {}
+# Per-user session token to prevent stale cancel_match_wait from killing a new session
+_match_session_tokens: Dict[int, int] = {}
+# Telecast session: collects multi-part simulation text + match link from DM
+# {user_id: {"match_link": str, "parts": [str, ...], "total": int, "stage": str}}
+# stage: "collecting" (unlimited parts) -> "link" (asked for link) -> "ready" (send to group)
+_telecast_sessions: Dict[int, Dict[str, object]] = {}
+# Active live broadcasts — used to cancel in-progress sends
+_active_live_broadcasts: Dict[int, Dict[str, object]] = {}
+
+# Team name to short code mappings (e.g., {"India": "IND"})
+team_mappings: Dict[str, str] = database.load_team_shortcodes()
+# Default tournament team mappings
+_DEFAULT_TEAM_MAPPINGS: Dict[str, str] = {
+    "Manchester Super Giants": "MSG",
+    "Trent Rockets": "TR",
+    "London Spirits": "LS",
+    "Sun Risers Lead": "SRL",
+    "Welsh Fire": "WF",
+    "MI London": "MI",
+    "Southern Braves": "SB",
+    "Birmingham Phoenix": "BP",
+    "Durham Dukes": "DD",
+    "Western Thunders": "WT",
+    "Derby Falcons": "DF",
+    "Somerset Mavericks": "SM",
+}
+if not team_mappings:
+    team_mappings.update(_DEFAULT_TEAM_MAPPINGS)
+    database.save_team_shortcodes(team_mappings)
+# Cache for generated leaderboard images
+_image_cache: Dict[str, bytes] = {}
+# Telegram file_ids — reuse on re-send to avoid re-uploading
+_telegram_file_ids: Dict[str, str] = {}
+
+
+def _reverse_team_mappings() -> Dict[str, str]:
+    """Build a short_code -> team_name reverse lookup."""
+    return {code: name for name, code in team_mappings.items()}
+
+
+def _resolve_team_name(name_or_code: str) -> str:
+    """Resolve a short code to its full team name, or return as-is if already a name."""
+    reverse = _reverse_team_mappings()
+    return reverse.get(name_or_code, name_or_code)
+
+
+def _resolve_team_label(name_or_code: str) -> str:
+    """Return 'SHORT - Full Name' for a team identified by name or short code."""
+    full_name = _resolve_team_name(name_or_code)
+    code = team_mappings.get(full_name)
+    if code:
+        return f"{code} - {full_name}"
+    # name_or_code might be the short code itself
+    code = team_mappings.get(name_or_code)
+    if code:
+        return f"{code} - {name_or_code}"
+    return name_or_code
+
+
+def _resolve_team_code(team_name: str) -> str:
+    """Resolve a team name from match data to its registered short code.
+
+    Tolerates case differences and minor spelling variations (e.g.
+    'Sun Risers Leeds' vs registered 'Sun Risers Lead') via token overlap.
+    Returns an empty string when no mapping is close enough.
+    """
+    name = str(team_name).strip()
+    if not name:
+        return ""
+    # Exact match
+    code = team_mappings.get(name)
+    if code:
+        return code
+    # Case-insensitive exact match
+    lowered = name.lower()
+    for mapped_name, mapped_code in team_mappings.items():
+        if mapped_name.strip().lower() == lowered:
+            return mapped_code
+    # Fuzzy token-overlap match for near-identical names
+    name_tokens = set(lowered.split())
+    best_code, best_score = "", 0.0
+    for mapped_name, mapped_code in team_mappings.items():
+        mapped_tokens = set(mapped_name.strip().lower().split())
+        if not name_tokens or not mapped_tokens:
+            continue
+        overlap = len(name_tokens & mapped_tokens)
+        score = overlap / len(name_tokens | mapped_tokens)
+        if score > best_score:
+            best_score = score
+            best_code = mapped_code
+    if best_score >= 0.5:
+        return best_code
+    return ""
+
+
+def _get_player_team_code(player_name: str) -> str:
+    """Return the team short code a player belongs to, based on recorded matches.
+
+    Prefers the short codes stored in the match JSON (team1_short /
+    team2_short), falling back to fuzzy-resolving the team name against the
+    registered mappings, and finally to the squads table. Returns an empty
+    string when the player's team cannot be determined.
+    """
+    lowered = player_name.strip().lower()
+
+    def _find_in_match(match: Dict[str, object]) -> str:
+        players_data = match.get("players", {})
+        if not isinstance(players_data, dict):
+            return ""
+        t1_short = str(match.get("team1_short", "") or "").strip()
+        t2_short = str(match.get("team2_short", "") or "").strip()
+        team1_name = str(match.get("team1", "") or "").strip().lower()
+        team2_name = str(match.get("team2", "") or "").strip().lower()
+
+        for team_name, team_players in players_data.items():
+            if not isinstance(team_players, dict):
+                continue
+            found = (
+                player_name in team_players
+                or any(str(p).strip().lower() == lowered for p in team_players)
+            )
+            if not found:
+                continue
+            team_key = str(team_name).strip()
+            team_key_lower = team_key.lower()
+            # Prefer the short code carried in the match JSON itself
+            if t1_short and team_key_lower == team1_name:
+                return t1_short
+            if t2_short and team_key_lower == team2_name:
+                return t2_short
+            # Else resolve the team name against registered mappings
+            code = _resolve_team_code(team_key)
+            if code:
+                return code
+            # Single-sided codes: the one present must be this team's
+            if t1_short and not t2_short:
+                return t1_short
+            if t2_short and not t1_short:
+                return t2_short
+        return ""
+
+    for match in state.matches:
+        code = _find_in_match(match)
+        if code:
+            return code
+
+    # Fallback: registered squads
+    try:
+        for squad in database.get_squads():
+            if str(squad.get("player", "")).strip().lower() == lowered:
+                code = _resolve_team_code(str(squad.get("team", "")))
+                if code:
+                    return code
+    except Exception:
+        pass
+
+    return ""
+
+
+def _format_cap_player_name(player_name: str) -> str:
+    """Format a player name with their team short code, e.g. 'N. Pooran (SRL)'."""
+    code = _get_player_team_code(player_name)
+    return f"{player_name} ({code})" if code else player_name
+
+
+def _normalize_player_name(name: str) -> str:
+    """Normalize a player name for fuzzy matching: lowercase, sort tokens alphabetically."""
+    tokens = name.strip().lower().split()
+    return " ".join(sorted(tokens))
+
+
+def _find_canonical_player(new_name: str, existing_players: Dict[str, Any]) -> Optional[str]:
+    """Find an existing player name that matches new_name via fuzzy logic.
+
+    Returns the canonical (existing) name if a match is found, else None.
+    """
+    new_norm = _normalize_player_name(new_name)
+    new_tokens = set(new_norm.split())
+    best_match: Optional[str] = None
+    best_score = 0
+    for existing_name in existing_players:
+        existing_norm = _normalize_player_name(existing_name)
+        existing_tokens = set(existing_norm.split())
+        # Exact normalized match
+        if new_norm == existing_norm:
+            return existing_name
+        # Subset match: all tokens of the shorter name appear in the longer one
+        if new_tokens.issubset(existing_tokens) or existing_tokens.issubset(new_tokens):
+            return existing_name
+        # Token overlap scoring for non-subset cases
+        overlap = len(new_tokens & existing_tokens)
+        total = len(new_tokens | existing_tokens)
+        score = overlap / total if total else 0
+        if score > best_score:
+            best_score = score
+            best_match = existing_name
+    # Require at least 60% token overlap to merge non-subset matches
+    if best_score >= 0.6:
+        return best_match
+    return None
 
 
 def remove_last_match() -> bool:
@@ -1208,13 +1722,26 @@ def remove_last_match() -> bool:
         database.save_standing(team, stats)
     for player, stats in state.players.items():
         database.save_player_stat(player, stats)
+    _invalidate_image_cache()
     return True
 
 # Optional:
+# Put your match chat ID here to send match results to the group from DM.
+# Example: MATCH_CHAT_ID = -1001234567890
+# Set to None to disable.
+MATCH_CHAT_ID = os.getenv("MATCH_CHAT_ID")
 # Put your match topic ID here if using Telegram forum topics.
 # Example: MATCH_TOPIC_ID = 123456
 # Set to None to allow any topic.
 MATCH_TOPIC_ID = None
+# Telecast topic ID — loaded from database, set via /set_telecast_topic
+_telecast_topic_id: Optional[int] = None
+_saved_telecast_topic = database.get_config("telecast_topic_id")
+if _saved_telecast_topic:
+    try:
+        _telecast_topic_id = int(_saved_telecast_topic)
+    except ValueError:
+        pass
 for admin_id in parse_admin_ids(ADMIN_USER_IDS):
     state.set_admin(admin_id)
 
@@ -1239,6 +1766,7 @@ def validate_match_json(text: str) -> Optional[str]:
     required_fields = {
         "match_type", "balls_per_over", "balls_per_innings", "team1", "team2",
         "score1", "wickets1", "balls1", "score2", "wickets2", "balls2", "players",
+        "team1_short", "team2_short",
     }
     missing = sorted(field for field in required_fields if field not in payload)
     if missing:
@@ -1286,22 +1814,735 @@ def validate_match_for_tournament(match_data: Dict[str, object]) -> Optional[str
 def build_help() -> str:
     
     return (
-        "Send only JSON match data.\n"
-        "Buttons:\n"
-        "/start - welcome message\n"
-        "/standings - view the points table\n"
-        "/caps - choose an Orange Cap or Purple Cap leaderboard\n"
-        "/orangecap - show Orange Cap leaderboard\n"
-        "/purplecap - show Purple Cap leaderboard\n"
-        "Admins can use End tournament to clear data after confirmation.\n"
-        "/help - show this help\n\n"
-        "/Prompt - Display the complete prompt and JSON example for copy paste\n"
+        "📋 General\n"
+        "/start - Welcome message with buttons\n"
+        "/help - Show this help\n\n"
+        "📊 Standings & Stats\n"
+        "/table - View standings image\n"
+        "/standings - View the points table\n"
+        "/orangecap - Show Orange Cap image\n"
+        "/purplecap - Show Purple Cap image\n"
+        "/caps - Choose a cap leaderboard\n\n"
+        "🏏 Match Management (Admin)\n"
+        "/add_match - Submit a match JSON\n"
+        "/cancel_match - Cancel pending match submission\n"
+        "/prompt - Display match JSON prompt for copy paste\n"
+        "/simulation_prompt - Display match simulation prompt\n"
+        "/upcoming_prompt - Display updated Hundred simulation prompt\n\n"
+        "🎬 Live Telecast (Admin)\n"
+        "/set_telecast_topic - Set the topic for telecast (group, one-time)\n"
+        "/telecast - Start collecting (input via DM)\n"
+        "/match_link - Send match link after collecting parts (DM)\n"
+        "/go_telecast - Start live ball-by-ball telecast (group topic)\n"
+        "/cancel_telecast - Cancel active telecast (group or DM)\n\n"
+        "⚙️ Admin\n"
+        "/setshort CODE TeamName - Register team short code\n"
+        "/setadmin user_id - Add an admin user\n"
+        "Use End tournament button to clear data after confirmation.\n"
     )
 
 async def prompt_command(update, context):
+    user_id = update.message.from_user.id if update.message.from_user else None
+    is_group = update.message.chat.type in ("group", "supergroup")
+
+    text = build_match_prompt()
+    max_len = 4000
+
+    # Send to DM
+    if user_id:
+        try:
+            await context.bot.send_message(chat_id=user_id, text="📋 Match JSON Prompt")
+            if len(text) <= max_len:
+                await context.bot.send_message(chat_id=user_id, text=text)
+            else:
+                parts = []
+                while text:
+                    if len(text) <= max_len:
+                        parts.append(text)
+                        break
+                    split_at = text.rfind("\n", 0, max_len)
+                    if split_at == -1:
+                        split_at = max_len
+                    parts.append(text[:split_at])
+                    text = text[split_at:].lstrip("\n")
+                for part in parts:
+                    await context.bot.send_message(chat_id=user_id, text=part)
+        except Exception:
+            await update.message.reply_text("Could not send DM. Please start a private chat with the bot first.")
+            return
+
+    # Notify in group if called from a group
+    if is_group:
+        await update.message.reply_text("✅ Prompt sent to your DM.")
+
+
+async def simulation_prompt_command(update, context):
+    user_id = update.message.from_user.id if update.message.from_user else None
+    is_group = update.message.chat.type in ("group", "supergroup")
+
+    text = build_simulation_prompt()
+    max_len = 4000
+
+    # Send to DM
+    if user_id:
+        try:
+            await context.bot.send_message(chat_id=user_id, text="🏏 Simulation Prompt")
+            if len(text) <= max_len:
+                await context.bot.send_message(chat_id=user_id, text=text)
+            else:
+                parts = []
+                while text:
+                    if len(text) <= max_len:
+                        parts.append(text)
+                        break
+                    split_at = text.rfind("\n", 0, max_len)
+                    if split_at == -1:
+                        split_at = max_len
+                    parts.append(text[:split_at])
+                    text = text[split_at:].lstrip("\n")
+                for part in parts:
+                    await context.bot.send_message(chat_id=user_id, text=part)
+        except Exception:
+            await update.message.reply_text("Could not send DM. Please start a private chat with the bot first.")
+            return
+
+    # Notify in group if called from a group
+    if is_group:
+        await update.message.reply_text("✅ Simulation prompt sent to your DM.")
+
+
+async def upcoming_prompt_command(update, context):
+    user_id = update.message.from_user.id if update.message.from_user else None
+    is_group = update.message.chat.type in ("group", "supergroup")
+
+    text = build_upcoming_simulation_prompt()
+    max_len = 4000
+
+    # Send to DM
+    if user_id:
+        try:
+            await context.bot.send_message(chat_id=user_id, text="🏏 Upcoming Simulation Prompt (Updated Hundred Rules)")
+            if len(text) <= max_len:
+                await context.bot.send_message(chat_id=user_id, text=text)
+            else:
+                parts = []
+                while text:
+                    if len(text) <= max_len:
+                        parts.append(text)
+                        break
+                    split_at = text.rfind("\n", 0, max_len)
+                    if split_at == -1:
+                        split_at = max_len
+                    parts.append(text[:split_at])
+                    text = text[split_at:].lstrip("\n")
+                for part in parts:
+                    await context.bot.send_message(chat_id=user_id, text=part)
+        except Exception:
+            await update.message.reply_text("Could not send DM. Please start a private chat with the bot first.")
+            return
+
+    # Notify in group if called from a group
+    if is_group:
+        await update.message.reply_text("✅ Upcoming prompt sent to your DM.")
+
+
+async def add_match_command(update, context):
+    """Slash command equivalent of the Add Match button."""
+    user_id = update.message.from_user.id if update.message.from_user else None
+    is_group = update.message.chat.type in ("group", "supergroup")
+
+    if user_id is None or not state.is_admin(user_id):
+        await update.message.reply_text("Only admins can add matches.")
+        return
+
+    waiting_for_match[user_id] = True
+
+    # Start 5 minute timeout with a session token
+    _match_session_tokens[user_id] = _match_session_tokens.get(user_id, 0) + 1
+    asyncio.create_task(
+        cancel_match_wait(user_id, _match_session_tokens[user_id])
+    )
+
+    # Notify in group if called from a group
+    if is_group:
+        await update.message.reply_text("✅ Send the match JSON in your DM.")
+
+    # Send instructions via DM
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="📥 Send the match JSON now.\n\n"
+                 "Only your next message will be processed as a match.\n"
+                 "All other messages are ignored.\n\n"
+                 "Type /cancel_match to cancel."
+        )
+    except Exception:
+        await update.message.reply_text("Could not send DM. Please start a private chat with the bot first.")
+
+
+async def cancel_match_command(update, context):
+    """Cancel the pending add-match operation."""
+    user_id = update.message.from_user.id if update.message.from_user else None
+
+    if user_id is None or not state.is_admin(user_id):
+        await update.message.reply_text("Only admins can use this command.")
+        return
+
+    if waiting_for_match.pop(user_id, None):
+        _match_session_tokens.pop(user_id, None)
+        await update.message.reply_text("❌ Match submission cancelled.")
+    else:
+        await update.message.reply_text("No pending match submission to cancel.")
+
+
+async def telecast_command(update: Any, context: Any) -> None:
+    """Start collecting unlimited simulation messages in the group topic."""
+    user_id = getattr(getattr(update.message, "from_user", None), "id", None)
+    is_group = update.message.chat.type in ("group", "supergroup")
+
+    if not is_group:
+        await update.message.reply_text("This command must be used in the group.")
+        return
+
+    if user_id is None or not state.is_admin(user_id):
+        await update.message.reply_text("Only admins can start a telecast.")
+        return
+
+    if _telecast_topic_id is None:
+        await update.message.reply_text(
+            "No telecast topic is set. Admin must run /set_telecast_topic first."
+        )
+        return
+
+    thread_id = update.message.message_thread_id
+    if thread_id != _telecast_topic_id:
+        await update.message.reply_text(
+            f"Telecast must be started in the designated telecast topic."
+        )
+        return
+
+    chat_id = update.message.chat_id
+    _telecast_sessions[user_id] = {
+        "match_link": "",
+        "parts": [],
+        "total": 0,
+        "stage": "collecting",
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+    }
+    await update.message.reply_text(
+        "🎬 Telecast mode started!\n\n"
+        "Now go to your DM with this bot and send your simulation messages one by one.\n"
+        "There is no limit on the number of parts.\n\n"
+        "When you are done sending all parts, go to your DM and use /match_link\n"
+        "to send the match link. Then come back here and use /go_telecast."
+    )
+
+
+async def start_telecast_command(update: Any, context: Any) -> None:
+    """Finish collecting in the group. Redirects to /match_link or /go_telecast."""
+    user_id = getattr(getattr(update.message, "from_user", None), "id", None)
+    is_group = update.message.chat.type in ("group", "supergroup")
+
+    if not is_group:
+        await update.message.reply_text("This command must be used in the group.")
+        return
+
+    if user_id is None or not state.is_admin(user_id):
+        await update.message.reply_text("Only admins can start a telecast.")
+        return
+
+    session = _telecast_sessions.get(user_id)
+    if not session:
+        await update.message.reply_text(
+            "No active telecast session. Use /telecast first to start collecting."
+        )
+        return
+
+    # If link has been collected, redirect to /go_telecast
+    if session.get("stage") == "ready":
+        parts: List[str] = session["parts"]  # type: ignore
+        total_parts = len(parts)
+        total_chars = sum(len(p) for p in parts)
+        await update.message.reply_text(
+            f"✅ Ready to broadcast! ({total_parts} parts, {total_chars} chars total).\n\n"
+            f"Use /go_telecast to start the live ball-by-ball broadcast."
+        )
+        return
+
+    # We have parts but no link yet — tell user to use /match_link in DM
+    if not session.get("parts"):
+        await update.message.reply_text(
+            "No simulation parts collected yet. Use /telecast first to start collecting."
+        )
+        return
+
+    total_parts = len(session["parts"])
+    total_chars = sum(len(p) for p in session["parts"])
+    await update.message.reply_text(
+        f"✅ {total_parts} parts collected ({total_chars} chars total).\n\n"
+        f"Now go to your DM and use /match_link to send the match link."
+    )
+    # Also send request to DM
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"✅ {total_parts} parts collected ({total_chars} chars total).\n\n"
+                 f"Now send the match link (the AI-generated link)."
+        )
+    except Exception:
+        pass
+
+
+async def match_link_command(update: Any, context: Any) -> None:
+    """Request the match link. Works in DM and group."""
+    user_id = getattr(getattr(update.message, "from_user", None), "id", None)
+    is_group = update.message.chat.type in ("group", "supergroup")
+    is_dm = update.message.chat.type == "private"
+
+    if user_id is None or not state.is_admin(user_id):
+        await update.message.reply_text("Only admins can use this command.")
+        return
+
+    session = _telecast_sessions.get(user_id)
+    if not session:
+        await update.message.reply_text(
+            "No active telecast session. Use /telecast in the group first."
+        )
+        return
+
+    if session.get("stage") == "ready":
+        await update.message.reply_text(
+            "✅ Match link already received! Use /go_telecast in the group to start the live broadcast."
+        )
+        return
+
+    if not session.get("parts"):
+        await update.message.reply_text(
+            "No simulation parts collected yet. Send your simulation messages in DM first."
+        )
+        return
+
+    session["stage"] = "link"
+    total_parts = len(session["parts"])
+    total_chars = sum(len(p) for p in session["parts"])
+
+    if is_group:
+        # If used in group, confirm and ask to go to DM
+        await update.message.reply_text(
+            f"✅ {total_parts} parts collected ({total_chars} chars total).\n\n"
+            f"Now go to your DM and send the match link."
+        )
+    else:
+        # If used in DM, ask directly for the link
+        await update.message.reply_text(
+            f"✅ {total_parts} parts collected ({total_chars} chars total).\n\n"
+            f"Now send the match link (the AI-generated link)."
+        )
+
+    # Also send request to DM if called from group
+    if is_group:
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"✅ {total_parts} parts collected ({total_chars} chars total).\n\n"
+                     f"Now send the match link (the AI-generated link)."
+            )
+        except Exception:
+            pass
+
+
+async def cancel_telecast_command(update: Any, context: Any) -> None:
+    """Cancel an in-progress telecast collection."""
+    user_id = getattr(getattr(update.message, "from_user", None), "id", None)
+
+    if user_id is None or not state.is_admin(user_id):
+        await update.message.reply_text("Only admins can cancel a telecast.")
+        return
+
+    # Cancel active live broadcast first
+    live_broadcast = _active_live_broadcasts.pop(user_id, None)
+    if live_broadcast:
+        live_broadcast["cancelled"] = True
+        await update.message.reply_text("❌ Live telecast cancelled.")
+        return
+
+    session = _telecast_sessions.get(user_id)
+    if session:
+        _telecast_sessions.pop(user_id, None)
+        await update.message.reply_text("❌ Telecast cancelled.")
+    else:
+        await update.message.reply_text("No active telecast to cancel.")
+
+
+# --- Live ball-by-ball telecast logic ---
+
+
+def _is_major_event_line(text: str) -> bool:
+    """Return True if the line is a major event that should NOT be part of a live-score block.
+
+    Major events: ball-by-ball (0.1, 12.3), over headers, over summaries,
+    innings breaks, wickets, and scorecard/result lines.
+    """
+    text_upper = text.upper()
+    # Ball-by-ball line (e.g. "0.1", "12.3", "5.5")
+    if re.match(r"^\d+\.\d+\b", text):
+        return True
+    # Over header
+    if re.match(r"^(\d+)(ST|ND|RD|TH)?\s+OVER", text_upper):
+        return True
+    # Over summary
+    if any(kw in text_upper for kw in ["END OF OVER", "OVER SUMMARY", "AFTER OVERS"]):
+        return True
+    # Innings break
+    if any(kw in text_upper for kw in ["INNINGS BREAK", "END OF INNINGS"]):
+        return True
+    # Wicket line (standalone, not inside a live score block)
+    if "WICKET" in text_upper or "OUT" in text_upper:
+        return True
+    return False
+
+
+def _is_highlight_ball(text: str) -> bool:
+    """Return True if a ball-by-ball line is a highlight worth sending.
+
+    Highlights: boundaries (FOUR / SIX / 4 runs / 6 runs), three runs
+    (rare), five runs (rare overthrows), and wickets (OUT / WICKET).
+    Dot balls, singles, and doubles are skipped to keep the telecast fast.
+    """
+    text_upper = text.upper()
+    if any(kw in text_upper for kw in ["FOUR", "SIX", "OUT", "WICKET"]):
+        return True
+    # Match literal run values: "3 runs", "4 runs", "5 runs", "6 runs"
+    if re.search(r"\b[3-6]\s*RUNS?\b", text_upper):
+        return True
+    return False
+
+
+def _get_ball_delay(text: str) -> int:
+    """Return the delay for a ball-by-ball line in seconds.
+
+    4 or 6 runs → 3 s  |  wicket → 3 s  |  everything else → 2 s
+    """
+    text_upper = text.upper()
+    if any(kw in text_upper for kw in ["FOUR", "SIX", "4!", "6!", "WICKET", "OUT"]):
+        return 3
+    return 2
+
+
+def _classify_telecast_line(line: str) -> tuple[str, int]:
+    """Classify a telecast line into a message type and delay in seconds.
+
+    Returns (message_type, delay_seconds).
+    """
+    text = line.strip()
+    if not text:
+        return "empty", 0
+
+    text_upper = text.upper()
+
+    # Wicket — dramatic pause
+    if "WICKET" in text_upper or "OUT" in text_upper:
+        return "wicket", 3
+
+    # Live score update
+    if any(kw in text_upper for kw in ["LIVE SCORE", "LIVE:", "NEED:", "CRR:", "RRR:"]):
+        return "score_update", 5
+
+    # Over header
+    if re.match(r"^(\d+)(ST|ND|RD|TH)?\s+OVER", text_upper):
+        return "over_header", 2
+
+    # Ball-by-ball line (e.g. "0.1", "12.3", "5.5")
+    if re.match(r"^\d+\.\d+\b", text):
+        return "ball", _get_ball_delay(text)
+
+    # Innings break / end of innings / first/second innings header
+    if "INNINGS" in text_upper:
+        return "innings_break", 10
+
+    # Toss result
+    if "TOSS" in text_upper:
+        return "over_header", 2
+
+    # Target announcement
+    if "TARGET" in text_upper:
+        return "over_header", 2
+
+    # End of over summary
+    if any(kw in text_upper for kw in ["END OF OVER", "OVER SUMMARY", "AFTER OVERS"]):
+        return "over_summary", 3
+
+    # Match result / presentation / POTM — sent with a dramatic pause
+    if any(kw in text_upper for kw in ["RESULT", "POTM"]):
+        return "result", 10
+
+    # Scorecard / batman / bowler / presentation details — sent at the end, no delay
+    if any(kw in text_upper for kw in ["SCORECARD", "BATSMAN", "BOWLER", "PRESENTATION"]):
+        return "scorecard", 0
+
+    # Match link at the end
+    if text_upper.startswith("MATCH LINK") or text_upper.startswith("🔗 MATCH LINK"):
+        return "scorecard", 0
+
+    # Default — treat as commentary line
+    return "ball", 2
+
+
+def _find_last_over_number(lines: list[str]) -> int:
+    """Return the highest over number found in ball-by-ball lines.
+
+    For example, lines containing '19.1', '19.2' → returns 19.
+    Returns -1 if no ball lines are found.
+    """
+    max_over = -1
+    for line in lines:
+        m = re.match(r"^(\d+)\.\d+\b", line.strip())
+        if m:
+            over_num = int(m.group(1))
+            if over_num > max_over:
+                max_over = over_num
+    return max_over
+
+
+def _group_lines_for_telecast(lines: list[str]) -> list[tuple[str, str, int]]:
+    """Group raw lines into (text, msg_type, delay) tuples.
+
+    Live-score blocks (LIVE: / LIVE SCORE plus all following batter/bowler /
+    partnership / last-wicket lines) are merged into a single message so the
+    group sees a clean scorecard rather than a flood of tiny messages.
+
+    All balls in the last over of each innings are shown regardless of runs
+    scored, so the finish is always fully visible.
+    """
+    last_over = _find_last_over_number(lines)
+
+    result: list[tuple[str, str, int]] = []
+    i = 0
+    while i < len(lines):
+        text = lines[i].strip()
+        if not text:
+            i += 1
+            continue
+
+        text_upper = text.upper()
+
+        # --- Live score block: gather continuation lines ---
+        if any(kw in text_upper for kw in ["LIVE SCORE", "LIVE:"]):
+            block: list[str] = [text]
+            i += 1
+            while i < len(lines):
+                nxt = lines[i].strip()
+                if not nxt:
+                    i += 1
+                    continue
+                if _is_major_event_line(nxt):
+                    break
+                block.append(nxt)
+                i += 1
+            result.append(("\n".join(block), "score_update", 5))
+            continue
+
+        # --- Scorecard / result / presentation block: gather continuation lines ---
+        msg_type, delay = _classify_telecast_line(text)
+        if msg_type in ("scorecard", "result"):
+            block = [text]
+            i += 1
+            while i < len(lines):
+                nxt = lines[i].strip()
+                if not nxt:
+                    i += 1
+                    continue
+                nxt_type, _ = _classify_telecast_line(nxt)
+                if nxt_type in ("ball", "over_header", "over_summary",
+                                "innings_break", "wicket", "score_update"):
+                    break
+                block.append(nxt)
+                i += 1
+            result.append(("\n".join(block), "scorecard", 0))
+            continue
+
+        # --- Everything else: classify individually ---
+
+        # Skip non-highlight ball lines UNLESS it's the last over
+        if msg_type == "ball" and not _is_highlight_ball(text):
+            # Check if this ball is in the last over
+            m = re.match(r"^(\d+)\.\d+\b", text)
+            if m and last_over >= 0 and int(m.group(1)) == last_over:
+                pass  # last over — show every ball
+            else:
+                i += 1
+                continue
+
+        result.append((text, msg_type, delay))
+        i += 1
+
+    return result
+
+
+async def _live_telecast_sender(
+    context: Any,
+    chat_id: int,
+    thread_id: int,
+    combined_text: str,
+    session: Dict[str, object],
+) -> None:
+    """Split combined simulation text into messages and send with delays.
+
+    Ball-by-ball: 0/1/2/3 runs → 2 s, FOUR/SIX/wicket → 3 s.
+    Over header 2 s, over summary 3 s, score update 5 s, innings break 15 s,
+    result 10 s. Scorecards/presentation are grouped at the end with no delay.
+    Live-score blocks (LIVE: + batters + bowlers + partnership) are merged
+    into a single message.
+    """
+    raw_lines = combined_text.split("\n")
+
+    # Group lines (merges live-score blocks)
+    classified = _group_lines_for_telecast(raw_lines)
+
+    if not classified:
+        return
+
+    # Find where the trailing scorecard/result block starts.
+    trailing_start = len(classified)
+    for i in range(len(classified) - 1, -1, -1):
+        _, msg_type, _ = classified[i]
+        if msg_type not in ("scorecard", "result", "empty"):
+            trailing_start = i + 1
+            break
+    if trailing_start == len(classified) and classified and classified[-1][1] in ("scorecard", "result", "empty"):
+        trailing_start = 0
+
+    # --- Send regular lines individually ---
+    regular = classified[:trailing_start]
+    trailing = classified[trailing_start:]
+    total_regular = len(regular)
+
+    for idx, (text, msg_type, delay) in enumerate(regular):
+        if session.get("cancelled"):
+            return
+
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                message_thread_id=thread_id,
+            )
+        except Exception:
+            pass
+
+        if delay > 0 and (idx < total_regular - 1 or trailing):
+            await asyncio.sleep(delay)
+
+    # --- Send trailing scorecard/result block as one message ---
+    if trailing:
+        if session.get("cancelled"):
+            return
+        trailing_text = "\n".join(text for text, _, _ in trailing)
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=trailing_text,
+                message_thread_id=thread_id,
+            )
+        except Exception:
+            pass
+
+    # Send the match link at the very end if present
+    match_link = session.get("match_link", "")
+    if match_link:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🔗 Match Link: {match_link}",
+                message_thread_id=thread_id,
+            )
+        except Exception:
+            pass
+
+    # Clean up active broadcast tracker
+    for uid, broadcast in list(_active_live_broadcasts.items()):
+        if broadcast is session:
+            _active_live_broadcasts.pop(uid, None)
+            break
+
+
+async def go_telecast_command(update: Any, context: Any) -> None:
+    """Trigger live ball-by-ball telecast of the collected simulation."""
+    user_id = getattr(getattr(update.message, "from_user", None), "id", None)
+    is_group = update.message.chat.type in ("group", "supergroup")
+
+    if not is_group:
+        await update.message.reply_text("This command must be used in the group.")
+        return
+
+    if user_id is None or not state.is_admin(user_id):
+        await update.message.reply_text("Only admins can start a live telecast.")
+        return
+
+    session = _telecast_sessions.get(user_id)
+    if not session or session.get("stage") != "ready" or not session.get("parts"):
+        await update.message.reply_text(
+            "No simulation ready. Use /telecast then /match_link in DM first."
+        )
+        return
+
+    # Verify same topic
+    thread_id = update.message.message_thread_id
+    if session.get("thread_id") and thread_id != session.get("thread_id"):
+        await update.message.reply_text(
+            "Please use /go_telecast in the same telecast topic."
+        )
+        return
+
+    parts: List[str] = session["parts"]  # type: ignore
+    match_link: str = session.get("match_link", "")  # type: ignore
+    combined = "\n\n".join(parts)
+    chat_id = session.get("chat_id")
+
+    # Clear the session so it can't be reused
+    _telecast_sessions.pop(user_id, None)
 
     await update.message.reply_text(
-        build_match_prompt()
+        f"🎬 Live telecast starting! ({len(parts)} parts, "
+        f"{len(combined)} chars)\n\n"
+        f"Messages will be sent with delays between them."
+    )
+
+    # Run the live sender in the background so the bot stays responsive
+    live_session = {"cancelled": False, "match_link": match_link}
+    _active_live_broadcasts[user_id] = live_session
+    asyncio.create_task(
+        _live_telecast_sender(context, chat_id, thread_id, combined, live_session)
+    )
+
+
+async def set_telecast_topic_command(update: Any, context: Any) -> None:
+    """Set the group topic ID where telecast messages are sent."""
+    global _telecast_topic_id
+    user_id = getattr(getattr(update.message, "from_user", None), "id", None)
+    is_group = update.message.chat.type in ("group", "supergroup")
+
+    if not is_group:
+        await update.message.reply_text("This command must be used in the group.")
+        return
+
+    if user_id is None or not state.is_admin(user_id):
+        await update.message.reply_text("Only admins can set the telecast topic.")
+        return
+
+    thread_id = update.message.message_thread_id
+    if not thread_id:
+        await update.message.reply_text(
+            "This command must be used inside a forum topic, not the general chat."
+        )
+        return
+
+    _telecast_topic_id = thread_id
+    database.set_config("telecast_topic_id", str(thread_id))
+    await update.message.reply_text(
+        f"✅ Telecast topic set to topic {thread_id}.\n"
+        f"All telecast messages will be sent here."
     )
 
 
@@ -1407,6 +2648,7 @@ def handle_message(text: str, user_id: Optional[int] = None) -> str:
         for player, stats in state.players.items():
             database.save_player_stat(player, stats)
 
+        _invalidate_image_cache()
         return f"✅ Match added successfully.\n\n{format_standings(state.get_standings())}"
 
     return "⚠️ Please send valid JSON match data. Use /prompt for the template."
@@ -1425,9 +2667,32 @@ async def help_command(update: Any, context: Any) -> None:
     await update.message.reply_text(build_help(), reply_markup=build_main_keyboard(user_id))
 
 
+async def _send_cached_photo(update: Any, cache_key: str, img_getter: Any, caption: str) -> bool:
+    """Send a photo, reusing Telegram file_id if available. Returns True if sent."""
+    # Reuse file_id from a previous send — no re-upload needed
+    if cache_key in _telegram_file_ids:
+        try:
+            await update.message.reply_photo(photo=_telegram_file_ids[cache_key], caption=caption)
+            return True
+        except Exception:
+            # file_id expired or invalid — fall through to re-upload
+            _telegram_file_ids.pop(cache_key, None)
+
+    img = img_getter() if callable(img_getter) else img_getter
+    if img is None:
+        return False
+    msg = await update.message.reply_photo(photo=img, caption=caption)
+    # Save the file_id from the largest photo Telegram returned
+    if msg and msg.photo and len(msg.photo) > 0:
+        _telegram_file_ids[cache_key] = msg.photo[-1].file_id
+    return True
+
+
 async def standings_command(update: Any, context: Any) -> None:
-    user_id = getattr(getattr(update.message, "from_user", None), "id", None)
-    await update.message.reply_text(format_standings(state.get_standings()), reply_markup=build_main_keyboard(user_id))
+    sent = await _send_cached_photo(update, "standings", get_standings_image, "The Hundred Tournament - Standings")
+    if not sent:
+        user_id = getattr(getattr(update.message, "from_user", None), "id", None)
+        await update.message.reply_text(format_standings(state.get_standings()), reply_markup=build_main_keyboard(user_id))
 
 
 async def caps_command(update: Any, context: Any) -> None:
@@ -1438,13 +2703,17 @@ async def caps_command(update: Any, context: Any) -> None:
 
 
 async def orange_cap_command(update: Any, context: Any) -> None:
-    text, total_pages = format_cap_page(state.players, "orange")
-    await update.message.reply_text(text, reply_markup=build_cap_page_keyboard("orange", 0, total_pages))
+    sent = await _send_cached_photo(update, "orange_cap", lambda: get_cap_image("orange"), "The Hundred - Orange Cap")
+    if not sent:
+        text, _ = format_cap_page(state.players, "orange")
+        await update.message.reply_text(text)
 
 
 async def purple_cap_command(update: Any, context: Any) -> None:
-    text, total_pages = format_cap_page(state.players, "purple")
-    await update.message.reply_text(text, reply_markup=build_cap_page_keyboard("purple", 0, total_pages))
+    sent = await _send_cached_photo(update, "purple_cap", lambda: get_cap_image("purple"), "The Hundred - Purple Cap")
+    if not sent:
+        text, _ = format_cap_page(state.players, "purple")
+        await update.message.reply_text(text)
 
 
 async def set_admin_command(update: Any, context: Any) -> None:
@@ -1511,8 +2780,29 @@ async def handle_callback_query(update: Any, context: Any) -> None:
         text = build_help()
         await query.message.reply_text(text, reply_markup=build_main_keyboard(user_id))
     elif data == "prompt":
-        text = "Prompt and JSON example:\n\n" + build_match_prompt()
-        await query.message.reply_text(text, reply_markup=build_main_keyboard(user_id))
+        # Send notification in group
+        await query.message.reply_text("✅ Prompt sent to your DM. Check your private chat with the bot.")
+        # Send actual prompt via DM
+        try:
+            text = "Prompt and JSON example:\n\n" + build_match_prompt()
+            max_len = 4000
+            if len(text) <= max_len:
+                await context.bot.send_message(chat_id=user_id, text=text)
+            else:
+                parts = []
+                while text:
+                    if len(text) <= max_len:
+                        parts.append(text)
+                        break
+                    split_at = text.rfind("\n", 0, max_len)
+                    if split_at == -1:
+                        split_at = max_len
+                    parts.append(text[:split_at])
+                    text = text[split_at:].lstrip("\n")
+                for part in parts:
+                    await context.bot.send_message(chat_id=user_id, text=part)
+        except Exception:
+            await query.message.reply_text("Could not send DM. Please start a private chat with the bot first.")
     elif data == "add_match":
 
         if user_id is None or not state.is_admin(user_id):
@@ -1524,21 +2814,30 @@ async def handle_callback_query(update: Any, context: Any) -> None:
 
         waiting_for_match[user_id] = True
 
-        # Start 5 minute timeout
+        # Start 5 minute timeout with a session token
+        _match_session_tokens[user_id] = _match_session_tokens.get(user_id, 0) + 1
         asyncio.create_task(
-            cancel_match_wait(user_id)
+            cancel_match_wait(user_id, _match_session_tokens[user_id])
         )
 
         await query.answer(
             "Waiting for match JSON"
         )
 
-
+        # Notify in group
         await query.message.reply_text(
-            "📥 Send the match JSON now.\n\n"
-            "Only your next message will be processed as a match.\n"
-            "All other group messages are ignored."
+            "✅ Send the match JSON in your DM."
         )
+        # Send instructions via DM
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="📥 Send the match JSON now.\n\n"
+                     "Only your next message will be processed as a match.\n"
+                     "All other messages are ignored."
+            )
+        except Exception:
+            await query.message.reply_text("Could not send DM. Please start a private chat with the bot first.")
     elif data == "remove_last_match":
         if user_id is None or not state.is_admin(user_id):
             await query.message.reply_text("Only an admin can remove a match.")
@@ -1580,6 +2879,7 @@ async def handle_callback_query(update: Any, context: Any) -> None:
             return
         state.clear_tournament()
         database.clear_tournament()
+        _invalidate_image_cache()
         await query.message.reply_text(
             "Tournament data cleared. A new tournament is ready to begin.",
             reply_markup=build_main_keyboard(user_id),
@@ -1592,6 +2892,242 @@ async def handle_callback_query(update: Any, context: Any) -> None:
     else:
         text = "Choose an option below."
         await query.message.reply_text(text, reply_markup=build_main_keyboard(user_id))
+
+
+def _load_monospace_font(size: int = 16):
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+        "/System/Library/Fonts/Menlo.ttc",
+        "C:\\Windows\\Fonts\\consola.ttf",
+    ]
+    if ImageFont is None:
+        return None
+    for path in font_paths:
+        try:
+            return ImageFont.truetype(path, size)
+        except (OSError, IOError):
+            continue
+    return ImageFont.load_default(size)
+
+
+def _generate_standings_image(standings: list) -> bytes:
+    font = _load_monospace_font(16)
+    bold_font = _load_monospace_font(18)
+    title = "The Hundred Tournament"
+    headers = ["#", "Team", "P", "W", "D", "L", "Pts", "NRR"]
+    rows = []
+    for idx, item in enumerate(standings, start=1):
+        rows.append([
+            str(idx),
+            _resolve_team_label(str(item["team"])),
+            str(item["played"]),
+            str(item["wins"]),
+            str(item["draws"]),
+            str(item["losses"]),
+            str(item["points"]),
+            f"{item['net_run_rate']:.3f}",
+        ])
+
+    pad = 20
+    row_h = 32
+    header_h = 40
+    title_h = 45
+    margin = 30
+
+    col_widths = []
+    for col_idx in range(len(headers)):
+        max_w = font.getlength(headers[col_idx]) if font else len(headers[col_idx]) * 10
+        for row in rows:
+            w = font.getlength(row[col_idx]) if font else len(row[col_idx]) * 10
+            max_w = max(max_w, w)
+        col_widths.append(int(max_w) + 24)
+
+    img_w = sum(col_widths) + 2 * pad + 2 * margin
+    img_h = pad + title_h + header_h + row_h * len(rows) + margin
+    bg = (20, 20, 30)
+    accent = (255, 165, 0)
+    text_color = (220, 220, 220)
+    header_bg = (40, 40, 55)
+    even_bg = (28, 28, 40)
+
+    img = Image.new("RGB", (img_w, img_h), bg) if Image else None
+    if img is None:
+        return b""
+    draw = ImageDraw.Draw(img)
+
+    y = pad
+    draw.text((margin, y), title, fill=accent, font=bold_font)
+    y += title_h
+    x = margin
+    for col_idx, header in enumerate(headers):
+        draw.rectangle([x, y, x + col_widths[col_idx], y + header_h], fill=header_bg)
+        draw.text((x + 8, y + 10), header, fill=text_color, font=bold_font)
+        x += col_widths[col_idx]
+
+    y += header_h
+    for row_idx, row in enumerate(rows):
+        row_bg = bg if row_idx % 2 == 0 else even_bg
+        x = margin
+        for col_idx, cell in enumerate(row):
+            draw.rectangle([x, y, x + col_widths[col_idx], y + row_h], fill=row_bg)
+            color = accent if col_idx == 1 and row_idx == 0 else text_color
+            draw.text((x + 8, y + 7), cell, fill=color, font=font)
+            x += col_widths[col_idx]
+        y += row_h
+
+    draw.rectangle([margin, y, margin + sum(col_widths), y + 4], fill=accent)
+
+    import io
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _generate_cap_image(cap_type: str, leaders: list) -> bytes:
+    leaders = leaders[:10]  # Only show top 10
+    font = _load_monospace_font(16)
+    bold_font = _load_monospace_font(18)
+    if cap_type == "orange":
+        title = "The Hundred - Orange Cap"
+        headers = ["#", "Player", "Runs", "SR"]
+        accent = (255, 140, 0)
+    else:
+        title = "The Hundred - Purple Cap"
+        headers = ["#", "Player", "Wkts", "Econ"]
+        accent = (148, 0, 211)
+
+    rows = []
+    for idx, item in enumerate(leaders, start=1):
+        player_label = _format_cap_player_name(str(item["name"]))
+        if cap_type == "orange":
+            rows.append([str(idx), player_label, str(item["runs"]), f"{item['strike_rate']:.2f}"])
+        else:
+            rows.append([str(idx), player_label, str(item["wickets"]), f"{item['economy']:.2f}"])
+
+    pad = 20
+    row_h = 32
+    header_h = 40
+    title_h = 45
+    margin = 30
+
+    col_widths = []
+    for col_idx in range(len(headers)):
+        max_w = font.getlength(headers[col_idx]) if font else len(headers[col_idx]) * 10
+        for row in rows:
+            w = font.getlength(row[col_idx]) if font else len(row[col_idx]) * 10
+            max_w = max(max_w, w)
+        col_widths.append(int(max_w) + 24)
+
+    img_w = sum(col_widths) + 2 * pad + 2 * margin
+    img_h = pad + title_h + header_h + row_h * len(rows) + margin
+    bg = (20, 20, 30)
+    text_color = (220, 220, 220)
+    header_bg = (40, 40, 55)
+    even_bg = (28, 28, 40)
+
+    img = Image.new("RGB", (img_w, img_h), bg) if Image else None
+    if img is None:
+        return b""
+    draw = ImageDraw.Draw(img)
+
+    draw.text((margin, pad), title, fill=accent, font=bold_font)
+    y = pad + title_h
+    x = margin
+    for col_idx, header in enumerate(headers):
+        draw.rectangle([x, y, x + col_widths[col_idx], y + header_h], fill=header_bg)
+        draw.text((x + 8, y + 10), header, fill=text_color, font=bold_font)
+        x += col_widths[col_idx]
+
+    y += header_h
+    for row_idx, row in enumerate(rows):
+        row_bg = bg if row_idx % 2 == 0 else even_bg
+        x = margin
+        for col_idx, cell in enumerate(row):
+            draw.rectangle([x, y, x + col_widths[col_idx], y + row_h], fill=row_bg)
+            color = accent if col_idx == 1 and row_idx == 0 else text_color
+            draw.text((x + 8, y + 7), cell, fill=color, font=font)
+            x += col_widths[col_idx]
+        y += row_h
+
+    draw.rectangle([margin, y, margin + sum(col_widths), y + 4], fill=accent)
+
+    import io
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _invalidate_image_cache() -> None:
+    _image_cache.clear()
+    _telegram_file_ids.clear()
+
+
+def get_standings_image() -> Optional[bytes]:
+    standings = state.get_standings()
+    if not standings:
+        return None
+    cache_key = json.dumps(standings, sort_keys=True)
+    if cache_key in _image_cache:
+        return _image_cache[cache_key]
+    img_bytes = _generate_standings_image(standings)
+    if img_bytes:
+        _image_cache[cache_key] = img_bytes
+    return img_bytes or None
+
+
+def get_cap_image(cap_type: str) -> Optional[bytes]:
+    leaders = get_caps_leaders(state.players, cap_type, top_n=len(state.players))
+    if not leaders:
+        return None
+    cache_key = f"cap:{cap_type}:" + json.dumps(leaders, sort_keys=True)
+    if cache_key in _image_cache:
+        return _image_cache[cache_key]
+    img_bytes = _generate_cap_image(cap_type, leaders)
+    if img_bytes:
+        _image_cache[cache_key] = img_bytes
+    return img_bytes or None
+
+
+async def setshort_command(update: Any, context: Any) -> None:
+    user_id = getattr(getattr(update.message, "from_user", None), "id", None)
+    if user_id is None or not state.is_admin(user_id):
+        await update.message.reply_text("Only admins can set team short codes.")
+        return
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: /setshort CODE TeamName\nExample: /setshort IND India"
+        )
+        return
+    code = context.args[0].upper().strip()
+    team_name = " ".join(context.args[1:]).strip()
+    if not code or not team_name:
+        await update.message.reply_text("Both short code and team name are required.")
+        return
+    team_mappings[team_name] = code
+    database.save_team_shortcodes(team_mappings)
+    await update.message.reply_text(f"Mapped {team_name} -> {code}")
+
+
+async def table_command(update: Any, context: Any) -> None:
+    sent = await _send_cached_photo(update, "standings", get_standings_image, "The Hundred Tournament - Standings")
+    if not sent:
+        await update.message.reply_text(format_standings(state.get_standings()))
+
+
+async def orange_cap_image_command(update: Any, context: Any) -> None:
+    sent = await _send_cached_photo(update, "orange_cap", lambda: get_cap_image("orange"), "The Hundred - Orange Cap")
+    if not sent:
+        text, _ = format_cap_page(state.players, "orange")
+        await update.message.reply_text(text)
+
+
+async def purple_cap_image_command(update: Any, context: Any) -> None:
+    sent = await _send_cached_photo(update, "purple_cap", lambda: get_cap_image("purple"), "The Hundred - Purple Cap")
+    if not sent:
+        text, _ = format_cap_page(state.players, "purple")
+        await update.message.reply_text(text)
 
 
 def run_console() -> None:
@@ -1613,11 +3149,45 @@ async def handle_text_message(update, context) -> None:
     if not update.message or not update.message.text:
         return
 
-    if MATCH_TOPIC_ID is not None:
+    is_group = update.message.chat.type in ("group", "supergroup")
+    is_dm = update.message.chat.type == "private"
+
+    # In group: only process if in the correct topic
+    if is_group and MATCH_TOPIC_ID is not None:
         if update.message.message_thread_id != MATCH_TOPIC_ID:
             return
 
     user_id = update.message.from_user.id if update.message.from_user else None
+
+    # --- Telecast message collection (DM input only) ---
+    if is_dm and user_id in _telecast_sessions:
+        session = _telecast_sessions[user_id]
+        stage = session["stage"]
+
+        if stage == "collecting":
+            # Unlimited parts — keep collecting until /match_link
+            parts: List[str] = session["parts"]  # type: ignore
+            parts.append(update.message.text)
+            await update.message.reply_text(
+                f"✅ Part {len(parts)} received ({sum(len(p) for p in parts)} chars total).\n\n"
+                f"Send the next part, or /match_link when done."
+            )
+            return
+
+        elif stage == "link":
+            # User sent the match link
+            session["match_link"] = update.message.text.strip()
+            session["stage"] = "ready"
+            await update.message.reply_text(
+                f"✅ Match link received!\n\n"
+                f"Go to the group topic and use /go_telecast to start the live broadcast,"
+                f"\nor /cancel_telecast in the group to discard."
+            )
+            return
+
+        elif stage == "ready":
+            # User sent extra text while ready — ignore
+            return
 
     # Ignore every message unless admin clicked Add Match
     if user_id not in waiting_for_match:
@@ -1648,11 +3218,28 @@ async def handle_text_message(update, context) -> None:
 
         for player, stats in state.players.items():
             database.save_player_stat(player, stats)
-        await update.message.reply_text(
-            f"✅ Match added successfully.\n\n"
-            f"{format_standings(state.get_standings())}",
-            reply_markup=build_main_keyboard(user_id)
-        )
+        _invalidate_image_cache()
+
+        # Confirm in DM
+        await update.message.reply_text("✅ Match added successfully!")
+
+        # Also send standings to the group if match was submitted from DM
+        if is_dm and MATCH_CHAT_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=MATCH_CHAT_ID,
+                    text=f"✅ Match added by {update.message.from_user.first_name}.\n\n"
+                         f"{format_standings(state.get_standings())}",
+                    reply_markup=build_main_keyboard(user_id),
+                )
+            except Exception:
+                pass
+        elif is_group:
+            await update.message.reply_text(
+                f"✅ Match added successfully.\n\n"
+                f"{format_standings(state.get_standings())}",
+                reply_markup=build_main_keyboard(user_id)
+            )
     else:
         await update.message.reply_text(
             "❌ Invalid match JSON.\nUse /help for the correct format."
@@ -1677,11 +3264,73 @@ def main() -> None:
     app.add_handler(CommandHandler("orangecap", orange_cap_command))
     app.add_handler(CommandHandler("purplecap", purple_cap_command))
     app.add_handler(CommandHandler("setadmin", set_admin_command))
+    app.add_handler(CommandHandler("table", table_command))
+    app.add_handler(CommandHandler("setshort", setshort_command))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(
         CommandHandler(
             "prompt",
             prompt_command
+        )
+    )
+    app.add_handler(
+        CommandHandler(
+            "simulation_prompt",
+            simulation_prompt_command
+        )
+    )
+    app.add_handler(
+        CommandHandler(
+            "upcoming_prompt",
+            upcoming_prompt_command
+        )
+    )
+    app.add_handler(
+        CommandHandler(
+            "add_match",
+            add_match_command
+        )
+    )
+    app.add_handler(
+        CommandHandler(
+            "cancel_match",
+            cancel_match_command
+        )
+    )
+    app.add_handler(
+        CommandHandler(
+            "telecast",
+            telecast_command
+        )
+    )
+    app.add_handler(
+        CommandHandler(
+            "match_link",
+            match_link_command
+        )
+    )
+    app.add_handler(
+        CommandHandler(
+            "start_telecast",
+            start_telecast_command
+        )
+    )
+    app.add_handler(
+        CommandHandler(
+            "cancel_telecast",
+            cancel_telecast_command
+        )
+    )
+    app.add_handler(
+        CommandHandler(
+            "set_telecast_topic",
+            set_telecast_topic_command
+        )
+    )
+    app.add_handler(
+        CommandHandler(
+            "go_telecast",
+            go_telecast_command
         )
     )
 
@@ -1692,6 +3341,41 @@ def main() -> None:
     )
     
 )
+
+    # Register slash commands so Telegram shows the suggestion menu
+    from telegram import BotCommand
+    bot_commands = [
+        # General
+        BotCommand("start", "Welcome message"),
+        BotCommand("help", "Show help"),
+        # Standings & Stats
+        BotCommand("table", "View standings image"),
+        BotCommand("standings", "View the points table"),
+        BotCommand("orangecap", "Orange Cap leaderboard"),
+        BotCommand("purplecap", "Purple Cap leaderboard"),
+        BotCommand("caps", "Choose a cap leaderboard"),
+        # Match Management
+        BotCommand("add_match", "Submit a match JSON"),
+        BotCommand("cancel_match", "Cancel pending match submission"),
+        BotCommand("prompt", "Get the match JSON prompt"),
+        BotCommand("simulation_prompt", "Get the match simulation prompt"),
+        BotCommand("upcoming_prompt", "Get the Hundred simulation prompt"),
+        # Live Telecast
+        BotCommand("set_telecast_topic", "Set telecast topic (admin, group)"),
+        BotCommand("telecast", "Start collecting simulation messages"),
+        BotCommand("match_link", "Send match link after collecting parts"),
+        BotCommand("start_telecast", "Finish collecting (legacy, redirects)"),
+        BotCommand("go_telecast", "Start live ball-by-ball telecast"),
+        BotCommand("cancel_telecast", "Cancel active telecast"),
+        # Admin
+        BotCommand("setshort", "Register a team short code"),
+        BotCommand("setadmin", "Add an admin user"),
+    ]
+
+    async def post_init(application) -> None:
+        await application.bot.set_my_commands(bot_commands)
+
+    app.post_init = post_init
 
     print("Bot started. Press Ctrl+C to stop.")
     app.run_polling()

@@ -195,7 +195,8 @@ TOTAL (18.2 overs, 10 wkts) 98 CRR: 5.40"""
         })
         complete = json.dumps({
             "match_type": "T20I", "balls_per_over": 6, "balls_per_innings": 120,
-            "team1": "A", "team2": "B", "score1": 100, "wickets1": 5, "balls1": 120,
+            "team1": "A", "team2": "B", "team1_short": "AA", "team2_short": "BB",
+            "score1": 100, "wickets1": 5, "balls1": 120,
             "score2": 90, "wickets2": 5, "balls2": 120,
             "players": {
                 "A": {"A Player": {"runs": 50, "balls_faced": 40, "wickets": 0, "runs_conceded": 0, "balls_bowled": 0}},
