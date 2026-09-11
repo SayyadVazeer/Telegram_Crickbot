@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -2178,6 +2179,36 @@ async def cancel_telecast_command(update: Any, context: Any) -> None:
 # --- Live ball-by-ball telecast logic ---
 
 
+def _looks_like_wicket(text: str) -> bool:
+    """Return True only for genuine wicket lines.
+
+    Avoids the substring traps where "beats the outside edge!", "Slater out
+    to open for TR" or the live block's "x Last wicket - ..." footer were
+    all treated as dramatic wicket events.
+    """
+    text_upper = text.upper()
+    # Live-block footer / scorecard lines that merely mention a wicket
+    if "LAST WICKET" in text_upper or "FALL OF WICKET" in text_upper:
+        return False
+    # Explicit dismissal call, e.g. "WICKET!" / "2.1 Mahmood to Slater, WICKET!"
+    # Case-sensitive on purpose: uppercase WICKET only appears in genuine
+    # dismissal calls, while prose mentions ("deep mid-wicket", "won by 4
+    # wickets", "wickets fell") are lowercase. "Wicket!" (capitalised +
+    # exclamation) is also accepted as a dismissal call.
+    if re.search(r"\bWICKETS?\b", text) or re.search(r"\bWickets?\s*!", text):
+        return True
+    # Ball line whose result token is a dismissal: ", OUT! ..."
+    if re.match(r"^\d+\.\d+\b", text) and re.search(r",\s*OUT\b", text_upper):
+        return True
+    # Over-end summary announcing a wicket: "Batter hit W."
+    if re.search(r"\bHIT\s+W\b\.?", text_upper):
+        return True
+    # Standalone announcement starting with the word, e.g. "OUT! Caught at deep!"
+    if re.match(r"^OUT\b", text_upper):
+        return True
+    return False
+
+
 def _is_major_event_line(text: str) -> bool:
     """Return True if the line is a major event that should NOT be part of a live-score block.
 
@@ -2197,8 +2228,12 @@ def _is_major_event_line(text: str) -> bool:
     # Innings break
     if any(kw in text_upper for kw in ["INNINGS BREAK", "END OF INNINGS"]):
         return True
+    # Innings headers terminate a live block (FIRST INNINGS: TR /
+    # SECOND INNINGS: X (Target: N) / INNINGS 1: X BATTING)
+    if re.search(r"\b(FIRST|SECOND|1ST|2ND)\s+INNINGS\b", text_upper) or re.search(r"\bINNINGS\s*\d\s*:", text_upper):
+        return True
     # Wicket line (standalone, not inside a live score block)
-    if "WICKET" in text_upper or "OUT" in text_upper:
+    if _looks_like_wicket(text):
         return True
     return False
 
@@ -2206,15 +2241,20 @@ def _is_major_event_line(text: str) -> bool:
 def _is_highlight_ball(text: str) -> bool:
     """Return True if a ball-by-ball line is a highlight worth sending.
 
-    Highlights: boundaries (FOUR / SIX / 4 runs / 6 runs), three runs
-    (rare), five runs (rare overthrows), and wickets (OUT / WICKET).
-    Dot balls, singles, and doubles are skipped to keep the telecast fast.
+    Highlights: boundaries (FOUR / SIX words, or bare "4." / "6." result
+    tokens), 3-6 run balls, and genuine wickets. Dot balls, singles, and
+    doubles are skipped to keep the telecast fast.
     """
     text_upper = text.upper()
-    if any(kw in text_upper for kw in ["FOUR", "SIX", "OUT", "WICKET"]):
+    if "FOUR" in text_upper or "SIX" in text_upper:
         return True
-    # Match literal run values: "3 runs", "4 runs", "5 runs", "6 runs"
+    if _looks_like_wicket(text):
+        return True
+    # Word format: "3 runs" / "4 runs" / "5 runs" / "6 runs"
     if re.search(r"\b[3-6]\s*RUNS?\b", text_upper):
+        return True
+    # Bare-digit format: "0.4 Mahmood to Slater, 4. Crunched through covers!"
+    if re.match(r"^\d+\.\d+\b", text) and re.search(r",\s*[3-6]\s*[.!]", text_upper):
         return True
     return False
 
@@ -2222,12 +2262,47 @@ def _is_highlight_ball(text: str) -> bool:
 def _get_ball_delay(text: str) -> int:
     """Return the delay for a ball-by-ball line in seconds.
 
-    4 or 6 runs → 3 s  |  wicket → 3 s  |  everything else → 2 s
+    Highlights (FOUR / SIX / 3-6 runs / wicket) → 7 s  |  everything else → 4 s
     """
     text_upper = text.upper()
-    if any(kw in text_upper for kw in ["FOUR", "SIX", "4!", "6!", "WICKET", "OUT"]):
-        return 3
-    return 2
+    if _looks_like_wicket(text):
+        return 7
+    if "FOUR" in text_upper or "SIX" in text_upper:
+        return 7
+    # Word format: "3 runs" ... "6 runs"
+    if re.search(r"\b[3-6]\s*RUNS?\b", text_upper):
+        return 7
+    # Bare-digit format: ", 4." / ", 6!"
+    if re.search(r",\s*[3-6]\s*[.!]", text_upper):
+        return 7
+    return 4
+
+
+def _is_scorecard_line(text: str) -> bool:
+    """Return True if the line looks like end-of-match scorecard table content.
+
+    Used to switch the telecast into "dump mode": once scorecard content
+    starts, everything remaining is flushed as fast as possible instead of
+    line-by-line with delays.
+    """
+    text_upper = text.upper()
+    # Live-score continuation phrases that mention batters/bowlers — not scorecard
+    if "CURRENT BATTERS" in text_upper or "CURRENT BOWLERS" in text_upper:
+        return False
+    # Strong, unambiguous scorecard markers
+    if "SCORECARD" in text_upper:
+        return True
+    # Table header rows: "BATTER ... RUNS BALLS SR" / "BOWLER ... OVERS RUNS WICKETS ECON"
+    # Require 2+ stat-column words so ordinary commentary mentioning a batter
+    # and their runs can never be mistaken for a scorecard header.
+    if re.search(r"\b(BATTER|BOWLER|BATSMAN)\b", text_upper):
+        stat_words = re.findall(r"\b(RUNS|BALLS|OVERS|DISMISSAL|ECON|WICKETS|WKTS|SR)\b", text_upper)
+        if len(stat_words) >= 2:
+            return True
+    # Scorecard section rows that start the line
+    if re.match(r"^(TOTAL\s*\(|EXTRAS\s*\(|DID NOT BAT|DID NOT BOWL|FALL\s+OF\s+WICKETS)", text_upper):
+        return True
+    return False
 
 
 def _classify_telecast_line(line: str) -> tuple[str, int]:
@@ -2241,52 +2316,67 @@ def _classify_telecast_line(line: str) -> tuple[str, int]:
 
     text_upper = text.upper()
 
+    # Scorecard table / presentation content — dumped at the end, no delays
+    if _is_scorecard_line(text):
+        return "scorecard", 0
+
     # Wicket — dramatic pause
-    if "WICKET" in text_upper or "OUT" in text_upper:
-        return "wicket", 3
+    if _looks_like_wicket(text):
+        # Over-end wicket bookkeeping ("End of odd over. Batter hit W. New
+        # batter (X) is non-striker.") — short pause to introduce the new
+        # batter; the dismissal itself was already telecast at full drama.
+        if re.match(r"^END\s+OF\s+(ODD|EVEN)\s+OVER\b", text_upper):
+            return "over_summary", 3
+        return "wicket", 7
 
     # Live score update
     if any(kw in text_upper for kw in ["LIVE SCORE", "LIVE:", "NEED:", "CRR:", "RRR:"]):
-        return "score_update", 5
+        return "score_update", 6
 
     # Over header
     if re.match(r"^(\d+)(ST|ND|RD|TH)?\s+OVER", text_upper):
-        return "over_header", 2
+        return "over_header", 4
 
     # Ball-by-ball line (e.g. "0.1", "12.3", "5.5")
     if re.match(r"^\d+\.\d+\b", text):
         return "ball", _get_ball_delay(text)
 
-    # Innings break / end of innings / first/second innings header
+    # Real innings breaks / end of innings — long dramatic pause
+    if any(kw in text_upper for kw in ["INNINGS BREAK", "END OF INNINGS", "INNINGS CLOSED"]):
+        return "innings_break", 19
+
+    # Innings headers (FIRST INNINGS: TR / SECOND INNINGS: ...) — normal pace
     if "INNINGS" in text_upper:
-        return "innings_break", 10
+        return "over_header", 4
 
     # Toss result
     if "TOSS" in text_upper:
-        return "over_header", 2
+        return "over_header", 4
 
     # Target announcement
     if "TARGET" in text_upper:
-        return "over_header", 2
+        return "over_header", 4
 
     # End of over summary
     if any(kw in text_upper for kw in ["END OF OVER", "OVER SUMMARY", "AFTER OVERS"]):
-        return "over_summary", 3
+        return "over_summary", 4
 
-    # Match result / presentation / POTM — sent with a dramatic pause
-    if any(kw in text_upper for kw in ["RESULT", "POTM"]):
-        return "result", 10
+    # Match result — dramatic pause before the scorecard dump
+    if "RESULT" in text_upper:
+        return "result", 14
 
-    # Scorecard / batman / bowler / presentation details — sent at the end, no delay
-    if any(kw in text_upper for kw in ["SCORECARD", "BATSMAN", "BOWLER", "PRESENTATION"]):
-        return "scorecard", 0
+    # POTM / presentation — normal commentary pace
+    if "POTM" in text_upper or "PRESENTATION" in text_upper:
+        return "over_header", 4
 
     # Match link at the end
     if text_upper.startswith("MATCH LINK") or text_upper.startswith("🔗 MATCH LINK"):
         return "scorecard", 0
 
-    # Default — treat as commentary line
-    return "ball", 2
+    # Default — treat as normal commentary (toss chatter, speeches, POTM,
+    # general broadcast lines). Always sent, never skipped by the highlight
+    # filter (which only applies to ball-by-ball lines).
+    return "commentary", 4
 
 
 def _find_last_over_number(lines: list[str]) -> int:
@@ -2305,6 +2395,54 @@ def _find_last_over_number(lines: list[str]) -> int:
     return max_over
 
 
+TELECAST_MAX_MESSAGE_CHARS = 3800
+
+
+def _chunk_scorecard_text(text: str, max_chars: int = TELECAST_MAX_MESSAGE_CHARS) -> list[str]:
+    """Split scorecard text into as few large chunks as Telegram allows.
+
+    Prefers breaking at blank lines so each chunk stays a readable block,
+    then at line boundaries, and hard-wraps only single oversized lines.
+    """
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+
+    def flush() -> None:
+        nonlocal current
+        if current.strip():
+            chunks.append(current.strip("\n"))
+        current = ""
+
+    for para in text.split("\n\n"):
+        candidate = f"{current}\n\n{para}" if current else para
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+        flush()
+        if len(para) <= max_chars:
+            current = para
+            continue
+        # Paragraph itself too large: split at line boundaries
+        for line in para.split("\n"):
+            candidate_line = f"{current}\n{line}" if current else line
+            if len(candidate_line) <= max_chars:
+                current = candidate_line
+                continue
+            flush()
+            while len(line) > max_chars:  # single huge line: hard wrap
+                chunks.append(line[:max_chars])
+                line = line[max_chars:]
+            current = line
+    flush()
+    return chunks
+
+
 def _group_lines_for_telecast(lines: list[str]) -> list[tuple[str, str, int]]:
     """Group raw lines into (text, msg_type, delay) tuples.
 
@@ -2314,6 +2452,10 @@ def _group_lines_for_telecast(lines: list[str]) -> list[tuple[str, str, int]]:
 
     All balls in the last over of each innings are shown regardless of runs
     scored, so the finish is always fully visible.
+
+    Once scorecard/presentation content starts, the telecast enters dump
+    mode: every remaining line is marked "dump" (0 delay) and the sender
+    flushes it as 1-3 large messages instead of one message per line.
     """
     last_over = _find_last_over_number(lines)
 
@@ -2326,6 +2468,46 @@ def _group_lines_for_telecast(lines: list[str]) -> list[tuple[str, str, int]]:
             continue
 
         text_upper = text.upper()
+
+        # --- Over-end bookkeeping lines: mostly never telecast ---
+        # "End of odd over. Batter hit 1. ... on strike for next over." etc.
+        # Pure strike-rotation info. Two exceptions fall through:
+        #   * wicket versions ("Batter hit W. New batter (X) is non-striker.")
+        #     announce the new batter — sent with a short 3 s pause;
+        #   * a combined innings-close line ("End of even over. Innings
+        #     closed.") must survive so the break gets its dramatic pause.
+        if re.match(r"^END\s+OF\s+(ODD|EVEN)\s+OVER\b", text_upper) and not any(
+            kw in text_upper
+            for kw in ["INNINGS CLOSED", "INNINGS BREAK", "END OF INNINGS", "BATTER HIT W"]
+        ):
+            i += 1
+            continue
+
+        # --- "BATTING TEAM NAME:" header directly before a LIVE block ---
+        if text_upper.startswith("BATTING TEAM NAME"):
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            nxt = lines[j].strip() if j < len(lines) else ""
+            if any(kw in nxt.upper() for kw in ["LIVE SCORE", "LIVE:"]):
+                block = [text]
+                j += 1
+                while j < len(lines):
+                    nxt2 = lines[j].strip()
+                    if not nxt2:
+                        j += 1
+                        continue
+                    if _is_major_event_line(nxt2):
+                        break
+                    block.append(nxt2)
+                    j += 1
+                result.append(("\n".join(block), "score_update", 6))
+                i = j
+                continue
+            # Standalone header (no live block after it)
+            result.append((text, "over_header", 4))
+            i += 1
+            continue
 
         # --- Live score block: gather continuation lines ---
         if any(kw in text_upper for kw in ["LIVE SCORE", "LIVE:"]):
@@ -2340,27 +2522,18 @@ def _group_lines_for_telecast(lines: list[str]) -> list[tuple[str, str, int]]:
                     break
                 block.append(nxt)
                 i += 1
-            result.append(("\n".join(block), "score_update", 5))
+            result.append(("\n".join(block), "score_update", 6))
             continue
 
-        # --- Scorecard / result / presentation block: gather continuation lines ---
+        # --- Scorecard content: enter dump mode ---
         msg_type, delay = _classify_telecast_line(text)
-        if msg_type in ("scorecard", "result"):
-            block = [text]
-            i += 1
-            while i < len(lines):
-                nxt = lines[i].strip()
-                if not nxt:
-                    i += 1
-                    continue
-                nxt_type, _ = _classify_telecast_line(nxt)
-                if nxt_type in ("ball", "over_header", "over_summary",
-                                "innings_break", "wicket", "score_update"):
-                    break
-                block.append(nxt)
-                i += 1
-            result.append(("\n".join(block), "scorecard", 0))
-            continue
+        if msg_type == "scorecard":
+            # Once scorecard content starts, swallow ALL remaining lines:
+            # they are flushed as a few large messages with no per-line
+            # delays instead of one message per line.
+            result.append((text, "scorecard", 0))
+            result.extend((line, "dump", 0) for line in lines[i + 1:])
+            return result
 
         # --- Everything else: classify individually ---
 
@@ -2389,11 +2562,12 @@ async def _live_telecast_sender(
 ) -> None:
     """Split combined simulation text into messages and send with delays.
 
-    Ball-by-ball: 0/1/2/3 runs → 2 s, FOUR/SIX/wicket → 3 s.
-    Over header 2 s, over summary 3 s, score update 5 s, innings break 15 s,
-    result 10 s. Scorecards/presentation are grouped at the end with no delay.
-    Live-score blocks (LIVE: + batters + bowlers + partnership) are merged
-    into a single message.
+    Highlights (FOUR / SIX / 3-6 runs / wicket) → 7 s, other balls → 4 s.
+    Over header 4 s, over summary 4 s, score update 6 s, innings break 19 s,
+    result 14 s. Toss and other normal commentary 4 s. Once scorecard content
+    appears, everything remaining is flushed in 1-3 large messages with no
+    per-line delays. Live-score blocks (LIVE: + batters + bowlers +
+    partnership) are merged into a single message.
     """
     raw_lines = combined_text.split("\n")
 
@@ -2403,14 +2577,18 @@ async def _live_telecast_sender(
     if not classified:
         return
 
-    # Find where the trailing scorecard/result block starts.
+    # Find where the trailing scorecard/dump block starts.
+    # "result" is deliberately excluded: the Result line is sent as a normal
+    # message so its dramatic pause is actually slept before the dump flushes.
     trailing_start = len(classified)
     for i in range(len(classified) - 1, -1, -1):
         _, msg_type, _ = classified[i]
-        if msg_type not in ("scorecard", "result", "empty"):
+        if msg_type not in ("scorecard", "empty", "dump"):
             trailing_start = i + 1
             break
-    if trailing_start == len(classified) and classified and classified[-1][1] in ("scorecard", "result", "empty"):
+    if classified and all(
+        msg_type in ("scorecard", "empty", "dump") for _, msg_type, _ in classified
+    ):
         trailing_start = 0
 
     # --- Send regular lines individually ---
@@ -2434,19 +2612,20 @@ async def _live_telecast_sender(
         if delay > 0 and (idx < total_regular - 1 or trailing):
             await asyncio.sleep(delay)
 
-    # --- Send trailing scorecard/result block as one message ---
+    # --- Send trailing scorecard content as 1-3 large messages ---
     if trailing:
-        if session.get("cancelled"):
-            return
         trailing_text = "\n".join(text for text, _, _ in trailing)
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=trailing_text,
-                message_thread_id=thread_id,
-            )
-        except Exception:
-            pass
+        for chunk in _chunk_scorecard_text(trailing_text):
+            if session.get("cancelled"):
+                return
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=chunk,
+                    message_thread_id=thread_id,
+                )
+            except Exception:
+                pass
 
     # Send the match link at the very end if present
     match_link = session.get("match_link", "")
@@ -3245,7 +3424,30 @@ async def handle_text_message(update, context) -> None:
             "❌ Invalid match JSON.\nUse /help for the correct format."
         )
 
+logger = logging.getLogger(__name__)
+
+
+async def _handle_error(update: object, context: Any) -> None:
+    """Log unhandled exceptions from handlers instead of crashing silently."""
+    error = getattr(context, "error", None)
+
+    # Network hiccups (TimeOut, connect failures) are transient — log them
+    # briefly at WARNING level; Telegram polling retries on its own.
+    from telegram.error import TimedOut, NetworkError  # noqa: PLC0415 — keep import local
+
+    if isinstance(error, (TimedOut, NetworkError)):
+        logger.warning("Telegram network issue (%s); operation will be retried automatically.", type(error).__name__)
+        return
+
+    logger.error("Exception while processing an update:", exc_info=error)
+
+
 def main() -> None:
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+        level=logging.INFO,
+    )
+
     if not TOKEN:
         print("No TELEGRAM_BOT_TOKEN found. Starting console mode instead.")
         run_console()
@@ -3256,7 +3458,18 @@ def main() -> None:
         run_console()
         return
 
-    app = Application.builder().token(TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        # More tolerant network timeouts: short defaults cause spurious
+        # TimedOut errors on slow or flaky connections.
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .pool_timeout(30.0)
+        .build()
+    )
+    app.add_error_handler(_handle_error)
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("standings", standings_command))
