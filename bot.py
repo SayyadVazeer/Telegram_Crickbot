@@ -2219,8 +2219,11 @@ def _is_major_event_line(text: str) -> bool:
     # Ball-by-ball line (e.g. "0.1", "12.3", "5.5")
     if re.match(r"^\d+\.\d+\b", text):
         return True
-    # Over header
-    if re.match(r"^(\d+)(ST|ND|RD|TH)?\s+OVER", text_upper):
+    # Over header ("3rd over ..." or Hundred-style "Over 3 - John Turner")
+    if re.match(r"^(\d+)(ST|ND|RD|TH)?\s+OVER\b", text_upper) or re.match(r"^OVER\s+\d+\b", text_upper):
+        return True
+    # Strike-update bookkeeping (">> Strike Update: ...") terminates a block
+    if re.match(r"^[>\s*]*STRIKE UPDATE\b", text_upper):
         return True
     # Over summary
     if any(kw in text_upper for kw in ["END OF OVER", "OVER SUMMARY", "AFTER OVERS"]):
@@ -2333,8 +2336,8 @@ def _classify_telecast_line(line: str) -> tuple[str, int]:
     if any(kw in text_upper for kw in ["LIVE SCORE", "LIVE:", "NEED:", "CRR:", "RRR:"]):
         return "score_update", 6
 
-    # Over header
-    if re.match(r"^(\d+)(ST|ND|RD|TH)?\s+OVER", text_upper):
+    # Over header ("3rd over ..." or Hundred-style "Over 3 - John Turner")
+    if re.match(r"^(\d+)(ST|ND|RD|TH)?\s+OVER\b", text_upper) or re.match(r"^OVER\s+\d+\b", text_upper):
         return "over_header", 4
 
     # Ball-by-ball line (e.g. "0.1", "12.3", "5.5")
@@ -2483,6 +2486,24 @@ def _group_lines_for_telecast(lines: list[str]) -> list[tuple[str, str, int]]:
             i += 1
             continue
 
+        # --- Strike-update bookkeeping lines: never telecast ---
+        # ">> Strike Update: Warner hit 1 (Odd to Even rule), moves to
+        # non-striker. Denly on strike." — pure strike-rotation info.
+        if re.match(r"^[>\s*]*STRIKE UPDATE\b", text_upper):
+            i += 1
+            continue
+
+        # --- "⚡ UPDATE (N Overs)" banner directly before a live block ---
+        # Skipped here; the BATTING TEAM NAME branch below merges it into the
+        # block (prevents the banner being sent twice). Otherwise keep it.
+        if re.search(r"UPDATE\s*\(\d+\s+OVERS?\)", text_upper):
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines) and lines[j].strip().upper().startswith("BATTING TEAM NAME"):
+                i += 1
+                continue
+
         # --- "BATTING TEAM NAME:" header directly before a LIVE block ---
         if text_upper.startswith("BATTING TEAM NAME"):
             j = i + 1
@@ -2490,7 +2511,15 @@ def _group_lines_for_telecast(lines: list[str]) -> list[tuple[str, str, int]]:
                 j += 1
             nxt = lines[j].strip() if j < len(lines) else ""
             if any(kw in nxt.upper() for kw in ["LIVE SCORE", "LIVE:"]):
-                block = [text]
+                # Optional "⚡ UPDATE (N Overs)" banner right before the block
+                k = i - 1
+                while k >= 0 and not lines[k].strip():
+                    k -= 1
+                prev = lines[k].strip() if k >= 0 else ""
+                # The LIVE score line itself MUST be part of the block
+                block = [text, nxt]
+                if re.search(r"UPDATE\s*\(\d+\s+OVERS?\)", prev.upper()):
+                    block.insert(0, prev)
                 j += 1
                 while j < len(lines):
                     nxt2 = lines[j].strip()
